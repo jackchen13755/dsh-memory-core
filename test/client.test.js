@@ -59,6 +59,14 @@ test('React 状态声明：必须是成对解构且 setter 带 set 前缀（历�
   }
 })
 
+test('每个 setX 都必须有对应声明（历史 bug：调用 setFullText 但没声明 → 渲染抛错、面板空白）', () => {
+  const declared = new Set([...client.matchAll(/const \[\w+, (set\w+)\] = st\(/g)].map((m) => m[1]))
+  const used = new Set([...client.matchAll(/\b(set[A-Z][A-Za-z0-9]*)\s*\(/g)].map((m) => m[1]))
+  const builtins = new Set(['setInterval', 'setTimeout', 'setImmediate', 'setProperty'])
+  const missing = [...used].filter((name) => !declared.has(name) && !builtins.has(name))
+  assert.deepEqual(missing, [], `这些 setter 被调用但没有声明：${missing.join(', ')}`)
+})
+
 test('面板交互契约：子 Tab（待确认/待办/技能/提示词 + 五轨）+ 美观/纯文本 + 搜索', () => {
   for (const piece of ["featureTab('queue'", "featureTab('todos'", "featureTab('skills'", "featureTab('prompts'"]) {
     assert.ok(client.includes(piece), `缺少功能页签：${piece}`)
