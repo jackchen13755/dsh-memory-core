@@ -1,0 +1,9 @@
+lib/ 目录是源码（本插件免构建，无编译产物），不忽略
+node_modules/
+dist/
+*.tgz
+.DS_Store
+*.log
+coverage/
+.tmp/
+eval/labels.local.json

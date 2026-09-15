@@ -1,0 +1,5 @@
+# Applied when a profile lists this bundle. The row mounts the plugin by package
+# name so Node resolves the installed code.
+- insert:
+    - id: memory-core
+      name: dsh-memory-core

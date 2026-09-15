@@ -1,0 +1,17 @@
+{
+  "$comment": "M1 标注集【合成样例】：真实标注集不进仓库（含个人记忆 id 与提问原文），本地放在 eval/labels.local.json（已 gitignore）。run.js 优先读本地那份，没有才用这份样例跑通链路。",
+  "targets": {
+    "topK": 5,
+    "hitRate": 0.8
+  },
+  "labels": [
+    { "query": "示例项目 A 的页面底部按钮我想自己写布局", "expect": ["1a2b3c4d"], "note": "入口词汇落差：记忆写「页脚组件 / 底部操作区」" },
+    { "query": "怎么从设计稿里拿节点数据", "expect": ["5e6f7a8b"], "note": "设计稿抓取链路" },
+    { "query": "缺陷单怎么置为已解决", "expect": ["9c0d1e2f"], "note": "缺陷系统 CLI 用法" },
+    { "query": "抓内网页面该用哪个工具", "expect": ["3f4a5b6c"], "note": "内网走浏览器桥接" },
+    { "query": "组件不要裸用 UI 库", "expect": ["7d8e9f0a"], "note": "项目约定：复用既有封装组件" },
+    { "query": "标签文案被截断还压住关闭图标", "expect": ["b1c2d3e4"], "note": "布局根因：flex 子项缺 min-width:0" },
+    { "query": "新机器上数据库客户端怎么装", "expect": ["f5a6b7c8"], "note": "环境事实：内置 sqlite 模块" },
+    { "query": "提交信息用什么语言写", "expect": ["2b3c4d5e"], "note": "用户偏好：中文提交信息" }
+  ]
+}

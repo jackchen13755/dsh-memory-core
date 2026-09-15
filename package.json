@@ -1,0 +1,57 @@
+{
+  "name": "dsh-memory-core",
+  "version": "0.0.1",
+  "private": true,
+  "description": "DeepSeek Harness 长期记忆插件：四通道检索 + 演化闭环 + 分层治理（SQLite 单一事实源 + Markdown 快照）",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js"
+  },
+  "bin": {
+    "dsh-mem": "bin/mem.js"
+  },
+  "files": [
+    "lib",
+    "bin",
+    "cordis.patch.yml",
+    "README.md",
+    "DESIGN.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "test": "node --test test/",
+    "cli": "node bin/mem.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "supported": {
+      "dsh": ">=0.1.5-rc.1",
+      "note": "以官方文档化的扩展点接线（tools.register / systemPrompt.context / 会话事件）；可选服务一律 ctx.get 探测，不写进硬 inject。不声明 peerDependencies 以避免 pnpm 安装期拉依赖。"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ]
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "long-term-memory",
+    "sqlite",
+    "memory-system"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jackchen13755/dsh-memory-core.git"
+  }
+}
