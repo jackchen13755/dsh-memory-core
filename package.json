@@ -1,13 +1,14 @@
 {
   "name": "dsh-memory-core",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "private": true,
   "description": "DeepSeek Harness 长期记忆插件：四通道检索 + 演化闭环 + 分层治理（SQLite 单一事实源 + Markdown 快照）",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
-    "./client": "./lib/client.js"
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
   },
   "bin": {
     "dsh-mem": "bin/mem.js"
