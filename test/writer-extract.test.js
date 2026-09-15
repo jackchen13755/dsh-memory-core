@@ -163,6 +163,28 @@ test('callExtractLlm：模型不支持档位时退回不带档位并记录降级
   assert.ok(String(res.degraded).includes('不支持'))
 })
 
+test('callExtractLlm：档位下正文为空 → 自动退回默认档位（本机网关对 off/none 静默空返回）', async () => {
+  const calls = []
+  const llm = {
+    stream(options) {
+      calls.push(options)
+      return (async function* () {
+        if (options.reasoningEffort) {
+          // 实测：网关不认该档位时不报错，只回 finish，正文与思考都是空
+          yield { type: 'finish' }
+          return
+        }
+        yield { type: 'text-delta', text: '{"items":[]}' }
+      })()
+    },
+  }
+  const res = await callExtractLlm({ llm, route: { provider: 'p', model: 'm' }, request: buildExtractRequest({ transcript: 'x' }) })
+  assert.equal(res.ok, true)
+  assert.equal(calls.length, 2, '应自动重试一次')
+  assert.equal(calls[1].reasoningEffort, undefined, '重试不带档位')
+  assert.ok(String(res.degraded).includes('正文为空'), res.degraded)
+})
+
 test('extractSession：产出全部进待确认队列（零直写），失败留痕', async () => {
   const { db, store, recall, cwd } = fixture()
   const llm = {
