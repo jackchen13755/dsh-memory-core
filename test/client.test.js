@@ -80,3 +80,38 @@ test('面板交互契约：子 Tab（待确认/待办/技能/提示词 + 五轨�
   assert.ok(client.includes('memcore-entry-ops'), '条目卡片需带操作区（编辑/归档/完成）')
   assert.ok(client.includes('加载失败：'), '加载失败要有可见错误而不是卡在加载中')
 })
+
+
+// ── 待确认队列：会话区分 + 归档可查（线上 bug 的两条根因在客户端的落点）─────────
+// bug①：工具写入的建议 session_id 为 NULL（服务端已修），面板侧必须始终显式带会话过滤 ——
+//        漏传 = 宿主的 `all`，条目会全跑到「全部」里；
+// bug②：「归档」只发不收（从前端根本没有入口把归档的建议查回来）。
+/** 在 vm 里求值客户端信封，取出 factory 暴露的模块对象（惰性才用到 document，无需 DOM）。 */
+function loadClientModule() {
+  const fakeReact = { createElement: () => null, useState: () => [null, () => {}], useEffect: () => {}, useCallback: (fn) => fn, useMemo: (fn) => fn(), useRef: (v) => ({ current: v }), Fragment: 'Fragment' }
+  let captured = null
+  const window = { __ModuleLoader__: { load: (mod) => { captured = mod } } }
+  new Function('window', 'require', 'module', 'exports', client)(window, (spec) => (spec === 'react' ? fakeReact : {}), { exports: {} }, {})
+  assert.ok(captured && captured.id === 'dsh-memory-core', '客户端信封必须注册 dsh-memory-core')
+  return { mod: captured.factory((spec) => (spec === 'react' ? fakeReact : {})), fakeReact }
+}
+
+test('会话过滤：本会话必带会话 id，拿不到会话时退 orphan（绝不退化成"全部"）', () => {
+  const { mod, fakeReact } = loadClientModule()
+  // sessionScopeOf / QueueView 都在 factory 闭包内不可直接取用：按源码契约验证
+  // （它拿不到会话时退 orphan，绝不会省掉参数退化成宿主默认的 all）。
+  // 取 `+ ` 后面到行尾的整个表达式（`sessionScopeOf(live)` / `SCOPE_ALL`），
+  // 再去掉 `api(...)` 的收尾括号与逗号
+  const calls = [...client.matchAll(/api\('\/suggestions\?status=(pending|archived)&sessionId='\s*\+\s*([^\n]+)/g)]
+    .map((m) => ({ status: m[1], expr: m[2].replace(/[),]+\s*$/, '') }))
+  assert.deepEqual(calls.map((c) => c.status).sort(), ['archived', 'pending', 'pending'], '三个查询：本会话 / 全部 / 已归档')
+  const exprs = calls.map((c) => c.expr)
+  assert.ok(exprs.some((e) => e.startsWith('sessionScopeOf(')), '本会话查询必须走 sessionScopeOf（拿不到会话退 orphan，绝不省掉参数退化成 all）')
+  assert.equal(exprs.filter((e) => e === 'SCOPE_ALL').length, 2, '「全部」与「已归档」显式传 all')
+  assert.ok(calls.some((c) => c.status === 'archived'), '缺少查「已归档」的请求：归档后就没地方找了')
+  // 恢复动作接的是宿主 restore 路由；归档视图有独立空态
+  assert.ok(client.includes("api('/suggestions/restore'"), '「已归档」视图必须有恢复动作（POST /suggestions/restore）')
+  assert.ok(client.includes('已归档 (') && client.includes('没有已归档的待确认'), '需要「已归档」分段与空态文案')
+  assert.equal(typeof mod.apply, 'function')
+  assert.equal(typeof fakeReact.createElement, 'function')
+})

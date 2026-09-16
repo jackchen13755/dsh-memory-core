@@ -7,7 +7,7 @@ import { closeDb, migrate, openDb } from '../lib/db.js'
 import { EXTRACT_DEFAULTS, buildExtractRequest, callExtractLlm, extractJson, extractSession, markExtracted, noteSessionActivity, parseExtraction, planAutoExtract, routeOf } from '../lib/extract.js'
 import { Recall } from '../lib/recall.js'
 import { Store } from '../lib/store.js'
-import { approveSuggestion, archiveSuggestion, rejectSuggestion, relate, scanSecrets, similarity, sweepSuggestions, writeMemory } from '../lib/writer.js'
+import { approveSuggestion, archiveSuggestion, rejectSuggestion, relate, restoreSuggestion, scanSecrets, similarity, sweepSuggestions, writeMemory } from '../lib/writer.js'
 
 function fixture() {
   const db = openDb(join(mkdtempSync(join(tmpdir(), 'memcore-m3-')), 'mem.db'))
@@ -262,4 +262,70 @@ test('routeOf：从会话 requestHeader 取模型路由', () => {
   assert.deepEqual(routeOf({ requestHeader: () => ({ config: { provider: 'tc-deepseek', model: 'm' } }) }), { provider: 'tc-deepseek', model: 'm' })
   assert.equal(routeOf({ requestHeader: () => ({}) }), null)
   assert.equal(routeOf({}), null)
+})
+
+// ── 待确认队列「本会话 / 全部」区分（线上 bug：工具写入的建议全成孤儿）────────
+// 现象：mem_write 走的是 `origin: session:<会话>` 这条路径，没显式传 sessionId，
+// 于是一律以 session_id = NULL 落库 —— 面板「本会话」永远是空的，条目全挤在「全部」里。
+test('writeMemory：只给 origin 不给 sessionId 时，从 origin 推导归属会话', () => {
+  const { db, store, recall, cwd } = fixture()
+  const res = writeMemory({
+    store,
+    recall,
+    cwd,
+    input: { content: '工具写入的规则：提交前必须跑 lint。', track: 'memory', kind: 'rule' },
+    origin: 'session:session-aaaa-bbbb',
+  })
+  assert.equal(res.status, 'queued')
+  const row = store.db.prepare('SELECT session_id FROM suggestions WHERE id = ?').get(res.id)
+  assert.equal(row.session_id, 'session-aaaa-bbbb', '建议必须带上归属会话，否则面板分不出「本会话」')
+  assert.equal(store.listSuggestions({ status: 'pending', sessionId: 'session-aaaa-bbbb' }).length, 1)
+
+  // 显式传 sessionId 时以显式值为准；工具无会话（origin=tool）时保持 NULL
+  const explicit = writeMemory({ store, recall, cwd, input: { content: '另一条规则：显式会话优先。', track: 'memory', kind: 'rule' }, origin: 'session:session-old', sessionId: 'session-new' })
+  assert.equal(store.db.prepare('SELECT session_id FROM suggestions WHERE id = ?').get(explicit.id).session_id, 'session-new')
+  const noSession = writeMemory({ store, recall, cwd, input: { content: '第三条规则：没有会话上下文。', track: 'memory', kind: 'rule' }, origin: 'tool' })
+  assert.equal(store.db.prepare('SELECT session_id FROM suggestions WHERE id = ?').get(noSession.id).session_id, null)
+  closeDb(db)
+})
+
+test('backfillSuggestionSessions：历史孤儿建议按 origin 两种形态回填（幂等）', () => {
+  const { db, store } = fixture()
+  const at = Date.now()
+  const insert = store.db.prepare("INSERT INTO suggestions (id, kind, target, payload, session_id, created_at, status) VALUES (?, 'memory', 'memory', ?, NULL, ?, 'pending')")
+  // ① 会话提取路径（extract:）② 工具写入路径（session:）③ 无从考据的（保持 NULL）
+  insert.run('bf-extract', JSON.stringify({ content: 'a', origin: 'extract:session-from-extract' }), at)
+  insert.run('bf-session', JSON.stringify({ content: 'b', origin: 'session:session-from-tool' }), at)
+  insert.run('bf-none', JSON.stringify({ content: 'c', origin: 'tool' }), at)
+
+  assert.equal(store.backfillSuggestionSessions(), 2)
+  const sid = (id) => store.db.prepare('SELECT session_id FROM suggestions WHERE id = ?').get(id).session_id
+  assert.equal(sid('bf-extract'), 'session-from-extract')
+  assert.equal(sid('bf-session'), 'session-from-tool', 'session: 前缀（历史 mem_write 产物）也必须能回填')
+  assert.equal(sid('bf-none'), null)
+  // 幂等：再跑一次没有可补的行
+  assert.equal(store.backfillSuggestionSessions(), 0)
+
+  // 面板「本会话」按会话过滤：两个会话各自只看自己的
+  assert.deepEqual(store.listSuggestions({ status: 'pending', sessionId: 'session-from-tool' }).map((r) => r.id), ['bf-session'])
+  assert.deepEqual(store.listSuggestions({ status: 'pending', sessionId: 'session-from-extract' }).map((r) => r.id), ['bf-extract'])
+  assert.equal(store.listSuggestions({ status: 'pending', sessionId: 'all' }).length, 3)
+  closeDb(db)
+})
+
+test('restoreSuggestion：归档可逆（归档 → 恢复回待确认 → 可再归档）', () => {
+  const { db, store, recall, cwd } = fixture()
+  const res = writeMemory({ store, recall, cwd, input: { content: '归档恢复用例：先归档再恢复。', track: 'memory', kind: 'rule' }, origin: 'session:s-1' })
+  assert.equal(archiveSuggestion({ store, id: res.id }).ok, true)
+  assert.equal(store.listSuggestions({ status: 'archived' }).length, 1)
+  assert.equal(store.listSuggestions({ status: 'pending' }).length, 0)
+
+  const back = restoreSuggestion({ store, id: res.id })
+  assert.equal(back.ok, true)
+  assert.equal(store.listSuggestions({ status: 'pending' }).map((r) => r.id).join(), res.id)
+  assert.equal(store.listSuggestions({ status: 'archived' }).length, 0)
+  // 未归档的不能再恢复（幂等保护），未知 id 明确报错
+  assert.equal(restoreSuggestion({ store, id: res.id }).ok, false)
+  assert.equal(restoreSuggestion({ store, id: 'nope' }).ok, false)
+  closeDb(db)
 })

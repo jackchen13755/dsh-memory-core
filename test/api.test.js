@@ -7,7 +7,7 @@ import { installApi } from '../lib/api.js'
 import { closeDb, migrate, openDb } from '../lib/db.js'
 import { PromptManager } from '../lib/prompts.js'
 import { Store } from '../lib/store.js'
-import { approveSuggestion, archiveSuggestion, rejectSuggestion, sweepSuggestions, writeMemory } from '../lib/writer.js'
+import { approveSuggestion, archiveSuggestion, rejectSuggestion, restoreSuggestion, sweepSuggestions, writeMemory } from '../lib/writer.js'
 import { Recall } from '../lib/recall.js'
 
 /** 假 webServer：捕获注册的路由，返回可控的 req/res。 */
@@ -24,6 +24,7 @@ function harness() {
       approveSuggestion: (a) => approveSuggestion({ store, ...a }),
       rejectSuggestion: (a) => rejectSuggestion({ store, ...a }),
       archiveSuggestion: (a) => archiveSuggestion({ store, ...a }),
+      restoreSuggestion: (a) => restoreSuggestion({ store, ...a }),
     },
     extractNow: async () => ({ ok: true, queued: 2 }),
     steer: () => true,
@@ -108,6 +109,23 @@ test('待确认队列：列表 / 采纳（可改轨）/ 拒绝 / 归档', async 
   const q3 = writeMemory({ store: h.store, recall: h.recall, cwd: null, input: { content: '第三条待确认。', track: 'memory', kind: 'rule' } })
   await h.call('POST', '/memory-core/api/suggestions/archive', { id: q3.id })
   assert.equal(h.store.listSuggestions({ status: 'archived' }).length, 1)
+
+  // 归档必须能在面板「已归档」视图里查回来（否则归档=丢件）；恢复后回到待确认队列
+  const arch = await h.call('GET', '/memory-core/api/suggestions?status=archived&sessionId=all')
+  assert.deepEqual(arch.json.entries.map((e) => e.id), [q3.id])
+  assert.equal(arch.json.entries[0].status, 'archived')
+  const restored = await h.call('POST', '/memory-core/api/suggestions/restore', { id: q3.id })
+  assert.equal(restored.json.results[0].ok, true)
+  assert.equal(h.store.listSuggestions({ status: 'archived' }).length, 0)
+  assert.deepEqual(h.store.listSuggestions({ status: 'pending' }).map((r) => r.id), [q3.id])
+
+  // 已归档的会话归属照旧，能被「本会话」过滤命中
+  const owned = writeMemory({ store: h.store, recall: h.recall, cwd: null, input: { content: '第四条待确认（归属会话）。', track: 'memory', kind: 'rule' }, origin: 'session:s-api-1' })
+  await h.call('POST', '/memory-core/api/suggestions/archive', { id: owned.id })
+  const mine = await h.call('GET', '/memory-core/api/suggestions?status=pending&sessionId=s-api-1')
+  assert.equal(mine.json.entries.length, 0, '归档后不在本会话待确认里')
+  const orphanish = await h.call('GET', '/memory-core/api/suggestions?status=pending&sessionId=other')
+  assert.equal(orphanish.json.entries.length, 0)
   closeDb(h.db)
 })
 
