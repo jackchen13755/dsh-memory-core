@@ -13,9 +13,9 @@
  *
  * 通用参数：`--db <路径>` 覆盖默认库位置。
  */
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { backupDaily, closeDb, latestBackup, migrate, openDb, quickCheck } from '../lib/db.js'
 import { importLegacy } from '../lib/legacy-import.js'
 import { backupDir, dataDir, dbPath as defaultDbPath, ensureDir, legacyMemoryDir } from '../lib/paths.js'
