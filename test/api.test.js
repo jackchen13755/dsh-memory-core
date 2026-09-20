@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -37,13 +37,22 @@ function harness() {
     todos,
     skills,
   }
+  // 与 lib/index.js 生产装配一致：writer 是「记忆专用」，approveSuggestion 是按 kind 分派的总入口
+  const approveByKind = ({ id, overrides = {}, decidedBy = 'user' }) => {
+    const row = store.db.prepare('SELECT kind FROM suggestions WHERE id = ?').get(String(id))
+    if (!row) return { ok: false, message: `未找到建议 ${id}` }
+    if (row.kind === 'todo') return todos.approveSuggestion({ id, overrides, decidedBy })
+    if (row.kind === 'skill') return skills.approveSuggestion({ id, overrides, decidedBy })
+    return approveSuggestion({ store, id, overrides, decidedBy })
+  }
+  runtime.approveSuggestion = approveByKind
   const routes = []
   const ctx = {
     inject: (_deps, cb) => {
       cb({ webServer: { register: (route) => (routes.push(route), () => {}) } })
     },
   }
-  installApi(ctx, { store, recall, prompts, ledger, runtime, host: { version: '0.1.5-rc.1', supported: '>=0.1.5-rc.1', compatible: true, caps: {} }, config: {} })
+  installApi(ctx, { store, recall, prompts, todos, skills, approveSuggestion: approveByKind, ledger, runtime, host: { version: '0.1.5-rc.1', supported: '>=0.1.5-rc.1', compatible: true, caps: {} }, config: {} })
   assert.equal(routes.length, 1, '应注册一条前缀路由')
   assert.equal(routes[0].kind, 'prefix')
   assert.equal(routes[0].path, '/memory-core/api')
@@ -236,6 +245,51 @@ test('技能写操作：禁用 / 启用（面板 2 个按钮的路由回归，�
   assert.equal(on.status, 200)
   assert.equal(on.json.ok, true)
   assert.equal(enabledOf(), 1)
+  closeDb(h.db)
+})
+
+test('技能建议：面板「采纳（写入技能库）」真的落盘并转 approved（只写临时技能目录）', async () => {
+  const h = harness()
+  const queuedSkill = h.skills.suggest({
+    name: 'panel-approve-skill',
+    description: '面板采纳回归用',
+    body: '## 步骤\n1. 面板点采纳后 SKILL.md 必须落盘并进索引。\n',
+    sessionId: 's-skill',
+    reason: '回归',
+  })
+  assert.equal(queuedSkill.ok, true)
+
+  const approve = await h.call('POST', '/memory-core/api/suggestions/approve', { id: queuedSkill.id })
+  assert.equal(approve.status, 200)
+  assert.equal(approve.json.ok, true)
+  assert.equal(approve.json.results[0].ok, true, `采纳必须成功，实际：${approve.json.results[0].message}`)
+
+  const file = join(h.skills.dir, 'panel-approve-skill', 'SKILL.md')
+  assert.ok(existsSync(file), 'SKILL.md 应落盘（技能文件是真相）')
+  assert.match(readFileSync(file, 'utf8'), /^---\nname: panel-approve-skill\ndescription: 面板采纳回归用\n---\n/)
+  assert.equal(h.store.db.prepare('SELECT status FROM suggestions WHERE id = ?').get(queuedSkill.id)?.status, 'approved')
+
+  // 技能建议不该被写进记忆轨（曾误投 writer → 「建议内容为空」）
+  assert.equal(h.store.counts().units, 0, '技能建议不能被当成记忆体写库')
+  const list = await h.call('GET', '/memory-core/api/skills')
+  assert.deepEqual(list.json.entries.map((e) => e.name), ['panel-approve-skill'])
+  closeDb(h.db)
+})
+
+test('技能建议采纳失败（名字不合法）不划勾：留在待确认队列，改完能重试', async () => {
+  const h = harness()
+  const bad = h.skills.suggest({ name: 'Bad Name', description: '非法 kebab-case', body: '## 步骤\n1. 名字不合法时应当报错且不划勾，改名后还能重试成功。\n' })
+  const denied = await h.call('POST', '/memory-core/api/suggestions/approve', { id: bad.id })
+  assert.equal(denied.json.results[0].ok, false)
+  assert.match(denied.json.results[0].message, /kebab-case/)
+  assert.equal(h.store.db.prepare('SELECT status FROM suggestions WHERE id = ?').get(bad.id)?.status, 'pending', '失败必须留在待确认队列')
+
+  const fixed = await h.call('POST', '/memory-core/api/suggestions/approve', {
+    id: bad.id,
+    overrides: { name: 'fixed-kebab-name', description: '改名后重试' },
+  })
+  assert.equal(fixed.json.results[0].ok, true, `改名重试应成功，实际：${fixed.json.results[0].message}`)
+  assert.ok(existsSync(join(h.skills.dir, 'fixed-kebab-name', 'SKILL.md')))
   closeDb(h.db)
 })
 

@@ -106,6 +106,20 @@ test('待办：模型自建走待确认队列，采纳后落地', () => {
   closeDb(db)
 })
 
+test('待办：落库失败不划勾（建议留在队列，改字段后重试）', () => {
+  const { db, store, todos } = fixture()
+  // 载荷里的轨道不合法 → 采纳时 add 失败（真实场景：模型给了未知轨道/重复条目）
+  const bad = todos.suggest({ content: '模型建议：轨道写错了', track: 'nonsense', sessionId: 's1' })
+  const denied = todos.approveSuggestion({ id: bad.id })
+  assert.equal(denied.ok, false)
+  assert.equal(store.db.prepare('SELECT status FROM suggestions WHERE id = ?').get(bad.id).status, 'pending', '失败不能划勾，否则卡片消失且无处找回')
+  const fixed = todos.approveSuggestion({ id: bad.id, overrides: { track: 'work' } })
+  assert.equal(fixed.ok, true, '改正轨道后重试应成功')
+  assert.equal(todos.stats().total, 1)
+  assert.equal(store.db.prepare('SELECT status FROM suggestions WHERE id = ?').get(bad.id).status, 'approved')
+  closeDb(db)
+})
+
 test('待办：提醒行只报条数；落盘格式与旧插件一致（能被 legacy 解析器读回）', () => {
   const { db, todos } = fixture()
   assert.equal(todos.reminderLine({ cwd: CWD }), null, '没有待办时不给提醒行')
@@ -206,6 +220,22 @@ test('技能：建议走待确认队列，采纳后写入技能库', () => {
   assert.equal(res.ok, true)
   assert.equal(skills.read('new-skill').ok, true)
   assert.equal(store.listSuggestions({ status: 'approved', kind: 'skill' }).length, 1)
+  closeDb(db)
+})
+
+test('技能：落盘失败不划勾（建议留在队列，可改名重试）', () => {
+  const { db, store, skills } = skillFixture()
+  const bad = skills.suggest({ name: 'Bad Name', description: '非法命名', body: '# 新技能\n\n正文足够长的一段说明文字。' })
+  const denied = skills.approveSuggestion({ id: bad.id })
+  assert.equal(denied.ok, false)
+  assert.match(denied.message, /kebab-case/)
+  assert.equal(store.db.prepare('SELECT status FROM suggestions WHERE id = ?').get(bad.id).status, 'pending', '失败不能划勾，否则卡片消失且无处找回')
+  assert.equal(store.listSuggestions({ status: 'approved', kind: 'skill' }).length, 0)
+
+  const fixed = skills.approveSuggestion({ id: bad.id, overrides: { name: 'good-name' } })
+  assert.equal(fixed.ok, true, '改名后重试应成功')
+  assert.equal(skills.read('good-name').ok, true)
+  assert.equal(store.db.prepare('SELECT status FROM suggestions WHERE id = ?').get(bad.id).status, 'approved')
   closeDb(db)
 })
 
