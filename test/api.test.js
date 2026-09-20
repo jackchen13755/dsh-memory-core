@@ -1,23 +1,29 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { installApi } from '../lib/api.js'
 import { closeDb, migrate, openDb } from '../lib/db.js'
 import { PromptManager } from '../lib/prompts.js'
+import { SkillManager } from '../lib/skills.js'
 import { Store } from '../lib/store.js'
+import { TodoManager } from '../lib/todos.js'
 import { approveSuggestion, archiveSuggestion, rejectSuggestion, restoreSuggestion, sweepSuggestions, writeMemory } from '../lib/writer.js'
 import { Recall } from '../lib/recall.js'
 
 /** 假 webServer：捕获注册的路由，返回可控的 req/res。 */
 function harness() {
-  const db = openDb(join(mkdtempSync(join(tmpdir(), 'memcore-api-')), 'mem.db'))
+  const root = mkdtempSync(join(tmpdir(), 'memcore-api-'))
+  const db = openDb(join(root, 'mem.db'))
   migrate(db)
   const store = new Store(db)
   const recall = new Recall(store)
   const prompts = new PromptManager(store)
   const ledger = { snapshot: () => ({ totals: { residentTokens: 10, recallTokens: 5, cards: 1, turns: 3, hitTurns: 2 } }) }
+  const todos = new TodoManager(store)
+  // 技能目录指向临时目录：面板写操作会真的改 SKILL.md，测试绝不能碰 ~/.agents/skills
+  const skills = new SkillManager(store, { dir: join(root, 'skills') })
   const runtime = {
     writer: {
       writeMemory: (a) => writeMemory({ store, recall, ...a }),
@@ -28,6 +34,8 @@ function harness() {
     },
     extractNow: async () => ({ ok: true, queued: 2 }),
     steer: () => true,
+    todos,
+    skills,
   }
   const routes = []
   const ctx = {
@@ -62,7 +70,7 @@ function harness() {
     await routes[0].handler(req, res)
     return { status, json: payload ? JSON.parse(payload) : null }
   }
-  return { db, store, recall, prompts, call }
+  return { db, store, recall, prompts, call, todos, skills }
 }
 
 test('GET /status：宿主信息 + 计数 + 注入账本', async () => {
@@ -181,6 +189,53 @@ test('记忆：列表 / 详情 / 编辑 / 归档恢复 / 404', async () => {
   assert.equal(missing.status, 404)
   const unknown = await h.call('GET', '/memory-core/api/nope')
   assert.equal(unknown.status, 404)
+  closeDb(h.db)
+})
+
+test('待办写操作：进行中 / 完成 / 删除（面板 3 个按钮的路由回归）', async () => {
+  const h = harness()
+  const added = h.todos.add({ content: '面板写操作回归', track: 'work' })
+  assert.equal(added.ok, true)
+  const statusOf = () => h.store.db.prepare('SELECT status FROM todos WHERE id = ?').get(added.id)?.status
+
+  const doing = await h.call('POST', '/memory-core/api/todos/update', { id: added.id, status: 'doing' })
+  assert.equal(doing.status, 200)
+  assert.equal(doing.json.ok, true)
+  assert.equal(statusOf(), 'doing')
+
+  const done = await h.call('POST', '/memory-core/api/todos/update', { id: added.id, action: 'done' })
+  assert.equal(done.status, 200)
+  assert.equal(done.json.ok, true)
+  assert.equal(statusOf(), 'done')
+
+  const removed = await h.call('POST', '/memory-core/api/todos/update', { id: added.id, action: 'remove' })
+  assert.equal(removed.status, 200)
+  assert.equal(removed.json.ok, true)
+  assert.equal(h.store.db.prepare('SELECT 1 AS x FROM todos WHERE id = ?').get(added.id), undefined)
+
+  const missing = await h.call('POST', '/memory-core/api/todos/update', { id: 'nope', action: 'remove' })
+  assert.equal(missing.json.ok, false)
+  closeDb(h.db)
+})
+
+test('技能写操作：禁用 / 启用（面板 2 个按钮的路由回归，只写临时技能目录）', async () => {
+  const h = harness()
+  const file = join(h.skills.dir, 'demo-skill', 'SKILL.md')
+  mkdirSync(join(h.skills.dir, 'demo-skill'), { recursive: true })
+  writeFileSync(file, '---\nname: demo-skill\ndescription: 回归用\n---\n\n正文若干。\n', 'utf8')
+  h.skills.scan()
+  const enabledOf = () => h.store.db.prepare('SELECT enabled FROM skills WHERE name = ?').get('demo-skill')?.enabled
+
+  const off = await h.call('POST', '/memory-core/api/skills/update', { name: 'demo-skill', action: 'disable' })
+  assert.equal(off.status, 200)
+  assert.equal(off.json.ok, true)
+  assert.match(readFileSync(file, 'utf8'), /disable-model-invocation: true/)
+  assert.equal(enabledOf(), 0)
+
+  const on = await h.call('POST', '/memory-core/api/skills/update', { name: 'demo-skill', action: 'enable' })
+  assert.equal(on.status, 200)
+  assert.equal(on.json.ok, true)
+  assert.equal(enabledOf(), 1)
   closeDb(h.db)
 })
 
