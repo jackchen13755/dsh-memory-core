@@ -5,6 +5,8 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { installApi } from '../lib/api.js'
 import { closeDb, migrate, openDb } from '../lib/db.js'
+import { noteSessionActivity } from '../lib/extract.js'
+import { projectHash } from '../lib/paths.js'
 import { PromptManager } from '../lib/prompts.js'
 import { SkillManager } from '../lib/skills.js'
 import { Store } from '../lib/store.js'
@@ -36,14 +38,17 @@ function harness() {
     steer: () => true,
     todos,
     skills,
+    // 与 lib/index.js 同款：按会话反查「当前打开的项目」的作用域（这里只演示 sessions 表这一路）
+    projectScopeForSession: (sessionId) =>
+      sessionId ? store.db.prepare('SELECT scope FROM sessions WHERE id = ?').get(String(sessionId))?.scope ?? null : null,
   }
   // 与 lib/index.js 生产装配一致：writer 是「记忆专用」，approveSuggestion 是按 kind 分派的总入口
-  const approveByKind = ({ id, overrides = {}, decidedBy = 'user' }) => {
+  const approveByKind = ({ id, overrides = {}, decidedBy = 'user', sessionId = null, projectScope = null }) => {
     const row = store.db.prepare('SELECT kind FROM suggestions WHERE id = ?').get(String(id))
     if (!row) return { ok: false, message: `未找到建议 ${id}` }
     if (row.kind === 'todo') return todos.approveSuggestion({ id, overrides, decidedBy })
     if (row.kind === 'skill') return skills.approveSuggestion({ id, overrides, decidedBy })
-    return approveSuggestion({ store, id, overrides, decidedBy })
+    return approveSuggestion({ store, id, overrides, decidedBy, projectScope: projectScope ?? runtime.projectScopeForSession(sessionId) })
   }
   runtime.approveSuggestion = approveByKind
   const routes = []
@@ -143,6 +148,73 @@ test('待确认队列：列表 / 采纳（可改轨）/ 拒绝 / 归档', async 
   assert.equal(mine.json.entries.length, 0, '归档后不在本会话待确认里')
   const orphanish = await h.call('GET', '/memory-core/api/suggestions?status=pending&sessionId=other')
   assert.equal(orphanish.json.entries.length, 0)
+  closeDb(h.db)
+})
+
+test('采纳 project/key 轨：落「当前打开的项目」，不沿用建议产生时那个项目', async () => {
+  const h = harness()
+  const cwdA = '/tmp/memcore-proj-a'
+  const cwdB = '/tmp/memcore-proj-b'
+  const scopeA = `project:${projectHash(cwdA)}`
+  const scopeB = `project:${projectHash(cwdB)}`
+  noteSessionActivity({ store: h.store, sessionId: 'sess-a', scope: scopeA })
+  noteSessionActivity({ store: h.store, sessionId: 'sess-b', scope: scopeB })
+
+  // 建议产生于 A 项目的会话（payload.scope = A）
+  const queued = writeMemory({
+    store: h.store,
+    recall: h.recall,
+    cwd: cwdA,
+    sessionId: 'sess-a',
+    input: { content: 'A 项目的约定（待确认）。', track: 'project', kind: 'fact' },
+    origin: 'extract:sess-a',
+  })
+  assert.equal(queued.status, 'queued')
+  assert.equal(JSON.parse(h.store.db.prepare('SELECT payload FROM suggestions WHERE id = ?').get(queued.id).payload).scope, scopeA)
+
+  // 用户在项目 B 的会话里点「按项目采纳」→ 必须落到 B
+  const approved = await h.call('POST', '/memory-core/api/suggestions/approve', { id: queued.id, sessionId: 'sess-b', overrides: { track: 'project' } })
+  assert.equal(approved.json.results[0].ok, true)
+  assert.equal(approved.json.results[0].scope, scopeB, 'scope 必须是当前打开的项目')
+  assert.equal(h.store.getUnit(approved.json.results[0].id).scope, scopeB)
+
+  // 不带 sessionId（没有"当前项目"上下文）时才退回建议原 scope
+  const q2 = writeMemory({
+    store: h.store,
+    recall: h.recall,
+    cwd: cwdA,
+    sessionId: 'sess-a',
+    input: { content: '第二条 A 项目约定。', track: 'key', kind: 'decision' },
+    origin: 'extract:sess-a',
+  })
+  const noSession = await h.call('POST', '/memory-core/api/suggestions/approve', { id: q2.id, overrides: { track: 'key' } })
+  assert.equal(noSession.json.results[0].scope, scopeA)
+
+  // 改轨到全局轨（memory）时不能把项目 scope 带过去：否则条目落在项目作用域里，面板五轨都看不见
+  const q3 = writeMemory({
+    store: h.store,
+    recall: h.recall,
+    cwd: cwdA,
+    sessionId: 'sess-a',
+    input: { content: '第三条 A 项目约定。', track: 'project', kind: 'fact' },
+    origin: 'extract:sess-a',
+  })
+  const switched = await h.call('POST', '/memory-core/api/suggestions/approve', { id: q3.id, sessionId: 'sess-b', overrides: { track: 'memory' } })
+  assert.equal(switched.json.results[0].scope, 'global')
+  assert.equal(h.store.getUnit(switched.json.results[0].id).scope, 'global')
+  closeDb(h.db)
+})
+
+test('GET /badge：带 sessionId 时只数本会话的待确认（红点/页签要和列表一致）', async () => {
+  const h = harness()
+  writeMemory({ store: h.store, recall: h.recall, cwd: null, sessionId: 'sess-mine', input: { content: '本会话待确认。', track: 'memory', kind: 'rule' }, origin: 'extract:sess-mine' })
+  writeMemory({ store: h.store, recall: h.recall, cwd: null, sessionId: 'sess-other', input: { content: '别的会话待确认。', track: 'memory', kind: 'rule' }, origin: 'extract:sess-other' })
+  const all = await h.call('GET', '/memory-core/api/badge')
+  assert.equal(all.json.suggestions, 2, '不带 sessionId 仍是全库计数（CLI 与旧调用方兼容）')
+  const mine = await h.call('GET', '/memory-core/api/badge?sessionId=sess-mine')
+  assert.equal(mine.json.suggestions, 1)
+  const other = await h.call('GET', '/memory-core/api/badge?sessionId=sess-other')
+  assert.equal(other.json.suggestions, 1)
   closeDb(h.db)
 })
 

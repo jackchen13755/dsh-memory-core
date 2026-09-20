@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { backupDaily, closeDb, latestBackup, migrate, openDb, quickCheck } from '../lib/db.js'
 import { importLegacy } from '../lib/legacy-import.js'
-import { backupDir, dataDir, dbPath as defaultDbPath, ensureDir, legacyMemoryDir } from '../lib/paths.js'
+import { backupDir, dataDir, dbPath as defaultDbPath, ensureDir, legacyMemoryDir, projectHash } from '../lib/paths.js'
 import { diffSnapshot, exportSnapshot } from '../lib/snapshot.js'
 import { Store } from '../lib/store.js'
 import * as tokensModule from '../lib/tokens.js'
@@ -398,9 +398,12 @@ function cmdReview(args) {
       return 2
     }
     for (const id of ids) {
+      // 采纳 project/key 轨时按「当前项目」落 scope（--cwd 优先，缺省用命令所在目录），
+      // 与面板一致：不沿用建议产生时那个项目的作用域
+      const projectScope = `project:${projectHash(args.cwd ?? process.cwd())}`
       const res =
         action === 'approve'
-          ? approveSuggestion({ store, id, overrides: { track: args.track, content: args.content, kind: args.kind }, decidedBy: 'cli' })
+          ? approveSuggestion({ store, id, overrides: { track: args.track, content: args.content, kind: args.kind }, decidedBy: 'cli', projectScope })
           : action === 'reject'
             ? rejectSuggestion({ store, id, reason: args.reason, decidedBy: 'cli' })
             : archiveSuggestion({ store, id, decidedBy: 'cli' })

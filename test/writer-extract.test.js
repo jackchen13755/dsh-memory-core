@@ -7,7 +7,7 @@ import { closeDb, migrate, openDb } from '../lib/db.js'
 import { EXTRACT_DEFAULTS, buildExtractRequest, callExtractLlm, extractJson, extractSession, markExtracted, noteSessionActivity, parseExtraction, planAutoExtract, routeOf } from '../lib/extract.js'
 import { Recall } from '../lib/recall.js'
 import { Store } from '../lib/store.js'
-import { approveSuggestion, archiveSuggestion, rejectSuggestion, relate, restoreSuggestion, scanSecrets, similarity, sweepSuggestions, writeMemory } from '../lib/writer.js'
+import { approveSuggestion, archiveSuggestion, rejectSuggestion, relate, resolveApproveScope, restoreSuggestion, scanSecrets, similarity, sweepSuggestions, writeMemory } from '../lib/writer.js'
 
 function fixture() {
   const db = openDb(join(mkdtempSync(join(tmpdir(), 'memcore-m3-')), 'mem.db'))
@@ -85,6 +85,34 @@ test('待确认队列：采纳落库、拒绝留痕、超期自动归档', () =>
   const queued3 = writeMemory({ store, recall, cwd, input: { content: '第三条待确认的建议。', track: 'memory', kind: 'rule' } })
   assert.equal(archiveSuggestion({ store, id: queued3.id }).ok, true)
   assert.equal(store.listSuggestions({ status: 'archived' }).length, 1)
+  closeDb(db)
+})
+
+test('采纳时的作用域：project/key 轨跟「当前项目」，改到全局轨不带项目 scope', () => {
+  const { db, store, recall } = fixture()
+  const scopeA = 'project:aaaaaaaaaaaa'
+  const scopeB = 'project:bbbbbbbbbbbb'
+  // 纯规则：显式 > 当前项目 > 建议产生时的 payload > global
+  assert.equal(resolveApproveScope({ track: 'project', projectScope: scopeB, payloadScope: scopeA }), scopeB, '当前打开的项目优先于建议产生时那个项目')
+  assert.equal(resolveApproveScope({ track: 'key', projectScope: null, payloadScope: scopeA }), scopeA, '没有当前项目时才退回原 scope')
+  assert.equal(resolveApproveScope({ track: 'key', explicitScope: 'global', projectScope: scopeB, payloadScope: scopeA }), 'global', '显式 scope 最高优先')
+  assert.equal(resolveApproveScope({ track: 'memory', projectScope: scopeB, payloadScope: scopeA }), 'global', '改到全局轨不能把项目 scope 带过去')
+  assert.equal(resolveApproveScope({ track: 'project' }), 'global', '兜底 global')
+
+  // 端到端：建议产生于 A 项目，采纳时当前项目是 B
+  const queued = writeMemory({
+    store,
+    recall,
+    cwd: '/tmp/proj-a',
+    sessionId: 'sess-a',
+    input: { content: 'A 项目的约定（待确认）。', track: 'project', kind: 'fact' },
+    origin: 'extract:sess-a',
+  })
+  assert.equal(queued.status, 'queued')
+  const ok = approveSuggestion({ store, id: queued.id, overrides: { track: 'project' }, projectScope: scopeB })
+  assert.equal(ok.ok, true)
+  assert.equal(ok.scope, scopeB)
+  assert.equal(store.getUnit(ok.id).scope, scopeB)
   closeDb(db)
 })
 

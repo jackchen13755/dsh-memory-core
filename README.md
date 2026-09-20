@@ -61,11 +61,11 @@ node bin/mem.js prompts import --from <旧 prompts.json>   # 从旧插件导入
 
 ```sh
 node bin/mem.js evolve [--halfLife 30] [--archiveBelow 0.15] [--json]   # 跑一次演化巡演
-curl http://127.0.0.1:3080/memory-core/api/badge                        # 红点计数
+curl http://127.0.0.1:3080/memory-core/api/badge                        # 红点计数（带 ?sessionId= 只数该会话）
 curl http://127.0.0.1:3080/memory-core/api/status                       # 健康度 + 提取 + 演化
-curl "http://127.0.0.1:3080/memory-core/api/suggestions?status=pending" # 待确认队列
-curl -X POST -d '{"id":"<id>","overrides":{"track":"key"}}' -H 'content-type: application/json' \
-     http://127.0.0.1:3080/memory-core/api/suggestions/approve
+curl "http://127.0.0.1:3080/memory-core/api/suggestions?status=pending&sessionId=<会话id>" # 待确认队列（面板只查本会话）
+curl -X POST -d '{"id":"<id>","sessionId":"<会话id>","overrides":{"track":"key"}}' -H 'content-type: application/json' \
+     http://127.0.0.1:3080/memory-core/api/suggestions/approve          # project/key 轨按该会话所在项目落 scope
 ```
 
 | 过程 | 行为 | 兜底/边界 |
@@ -135,7 +135,7 @@ CLI：`mem todo list|add|done|update|remove|remind|stats|export`、`mem skill li
 
 | 区块 | 操作 |
 |---|---|
-| 待确认队列 | 三个视图：**本会话**（只显示本会话的提取产物，标了条数）/ **全部**（跨会话汇总，卡片标注来源会话）/ **已归档**（归档不是终态，可 **恢复** 放回队列）；逐条 **采纳（可改轨）/ 拒绝 / 归档** |
+| 待确认队列 | 两个视图：**本会话**（只显示本会话的提取产物，标了条数；红点/页签计数同样只数本会话）/ **已归档**（归档不是终态，可 **恢复** 放回队列）；逐条 **采纳（可改轨）/ 拒绝 / 归档**。不设"全部"档：跨会话混看再采纳会把条目落进别的会话/项目。采纳 project/key 轨时 scope 按**当前打开的项目**解析（宿主按 sessionId 反查会话 cwd） |
 | 待办 | 需要关注 / 全部切换 + **完成 / 进行中 / 删除** |
 | 技能 | 搜索 + **启用 / 禁用**（写官方 frontmatter `disable-model-invocation`） |
 | 提示词 | **注入一次 / 持续注入 / 停止** |

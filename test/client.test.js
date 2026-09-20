@@ -82,9 +82,9 @@ test('面板交互契约：子 Tab（待确认/待办/技能/提示词 + 五轨�
 })
 
 
-// ── 待确认队列：会话区分 + 归档可查（线上 bug 的两条根因在客户端的落点）─────────
+// ── 待确认队列：只按会话展示 + 归档可查（线上 bug 的根因在客户端的落点）─────────
 // bug①：工具写入的建议 session_id 为 NULL（服务端已修），面板侧必须始终显式带会话过滤 ——
-//        漏传 = 宿主的 `all`，条目会全跑到「全部」里；
+//        漏传 = 宿主的 `all`（全库），跨会话混看再采纳 = 条目落到别的会话/项目里；
 // bug②：「归档」只发不收（从前端根本没有入口把归档的建议查回来）。
 /** 在 vm 里求值客户端信封，取出 factory 暴露的模块对象（惰性才用到 document，无需 DOM）。 */
 function loadClientModule() {
@@ -96,19 +96,36 @@ function loadClientModule() {
   return { mod: captured.factory((spec) => (spec === 'react' ? fakeReact : {})), fakeReact }
 }
 
-test('会话过滤：本会话必带会话 id，拿不到会话时退 orphan（绝不退化成"全部"）', () => {
+test('待确认队列：只查本会话（没有「全部」档），采纳带 sessionId', () => {
   const { mod, fakeReact } = loadClientModule()
   // sessionScopeOf / QueueView 都在 factory 闭包内不可直接取用：按源码契约验证
-  // （它拿不到会话时退 orphan，绝不会省掉参数退化成宿主默认的 all）。
-  // 取 `+ ` 后面到行尾的整个表达式（`sessionScopeOf(live)` / `SCOPE_ALL`），
-  // 再去掉 `api(...)` 的收尾括号与逗号
+  // （拿不到会话时退 orphan，绝不省掉参数退化成宿主默认的 all）。
   const calls = [...client.matchAll(/api\('\/suggestions\?status=(pending|archived)&sessionId='\s*\+\s*([^\n]+)/g)]
     .map((m) => ({ status: m[1], expr: m[2].replace(/[),]+\s*$/, '') }))
-  assert.deepEqual(calls.map((c) => c.status).sort(), ['archived', 'pending', 'pending'], '三个查询：本会话 / 全部 / 已归档')
-  const exprs = calls.map((c) => c.expr)
-  assert.ok(exprs.some((e) => e.startsWith('sessionScopeOf(')), '本会话查询必须走 sessionScopeOf（拿不到会话退 orphan，绝不省掉参数退化成 all）')
-  assert.equal(exprs.filter((e) => e === 'SCOPE_ALL').length, 2, '「全部」与「已归档」显式传 all')
+  // 待确认列表（pending）+ 页签计数（pending）+ 已归档：每条都必须按会话
+  assert.deepEqual([...new Set(calls.map((c) => c.status))].sort(), ['archived', 'pending'])
+  for (const c of calls) {
+    assert.ok(c.expr.startsWith('sessionScopeOf('), `每条查询都必须走 sessionScopeOf（漏传 = 全库）：${c.expr}`)
+  }
   assert.ok(calls.some((c) => c.status === 'archived'), '缺少查「已归档」的请求：归档后就没地方找了')
+
+  // 「全部」档必须彻底去掉：跨会话汇总再采纳，project/key 轨就会落到别的项目
+  assert.ok(!client.includes('SCOPE_ALL'), '不得再有 SCOPE_ALL（不按会话过滤的档）')
+  assert.ok(!/setScope\('all'\)/.test(client), '不得再有切「全部」的分段按钮')
+  // 注释里会提到"没有『全部』档"这件事，只查真正会渲染出来的字面量
+  const queueView = client
+    .slice(client.indexOf('function QueueView'), client.indexOf('function PromptsView'))
+    .replace(/^\s*\/\/.*$/gm, '')
+  assert.ok(queueView.length > 0, '必须能定位到 QueueView 源码')
+  assert.ok(!queueView.includes('全部'), '待确认视图里不得再出现「全部」')
+  assert.ok(queueView.includes('本会话 (') && queueView.includes('已归档 ('), '只留「本会话 / 已归档」两段')
+
+  // 采纳必须带当前会话 id：宿主按它反查「当前打开的项目」的作用域
+  assert.ok(/api\('\/suggestions\/approve'[\s\S]{0,240}?sessionId: liveOf\(\)/.test(client), '采纳请求必须带 sessionId（project/key 轨落当前项目）')
+  // 红点/页签计数同样按会话：否则角标 12 条、点进去 3 条
+  assert.ok(client.includes("api('/badge' + badgeQuery("), '角标计数必须带当前会话过滤')
+  assert.ok(client.includes("api('/suggestions?status=pending&sessionId=' + sessionScopeOf(live)"), '页签计数只数本会话')
+
   // 恢复动作接的是宿主 restore 路由；归档视图有独立空态
   assert.ok(client.includes("api('/suggestions/restore'"), '「已归档」视图必须有恢复动作（POST /suggestions/restore）')
   assert.ok(client.includes('已归档 (') && client.includes('没有已归档的待确认'), '需要「已归档」分段与空态文案')
