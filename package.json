@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-core",
-  "version": "0.0.11",
+  "version": "0.0.12",
   "private": true,
   "description": "DeepSeek Harness 长期记忆插件：四通道检索 + 演化闭环 + 分层治理（SQLite 单一事实源 + Markdown 快照）",
   "type": "module",

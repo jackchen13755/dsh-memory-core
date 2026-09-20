@@ -132,3 +132,36 @@ test('待确认队列：只查本会话（没有「全部」档），采纳带 s
   assert.equal(typeof mod.apply, 'function')
   assert.equal(typeof fakeReact.createElement, 'function')
 })
+
+// ── 「当前会话」解析（这一处曾经是本插件最要命的根因）─────────────────────────
+// 客户端曾读 `ctx.sessions.list.getSnapshot().current`，而 DSH 的会话列表快照里**没有 current**
+// （只有 ids/byId/phase/subagentsByParent/jobsBySession，官方包里零处这么读）→ 永远 null →
+// 面板一律退化成 orphan：「本会话」永远空、条目全挤进「全部」，采纳时也拿不到当前项目。
+// 官方口径 = 主视图正在展示的会话，即 retainedBy.mainView > 0（ui-workspace 三处同款）。
+test('当前会话解析：走官方口径 retainedBy.mainView，绝不再读幻影字段 snapshot.current', () => {
+  const { mod } = loadClientModule()
+  const t = mod.__test
+  assert.ok(t && typeof t.currentSessionIdOf === 'function', '客户端要暴露 currentSessionIdOf（纯函数）供契约测试')
+
+  const list = {
+    ids: ['session-a', 'session-b'],
+    byId: {
+      'session-a': { id: 'session-a', retainedBy: { mainView: 0 } },
+      'session-b': { id: 'session-b', retainedBy: { mainView: 2 } },
+    },
+  }
+  assert.equal(t.currentSessionIdOf(list), 'session-b', '当前会话 = retainedBy.mainView > 0 的那一个')
+  assert.equal(t.currentSessionIdOf({ ids: [], byId: {}, phase: 'ready' }), null, '没有展示中的会话就返回 null')
+  assert.equal(t.currentSessionIdOf(null), null, '拿不到快照要安全返回 null')
+  assert.equal(t.currentSessionIdOf({ byId: {}, current: 'session-c' }), 'session-c', '宿主将来真给 current 也要认（兜底）')
+
+  // 作用域哨兵：拿不到会话退 orphan，绝不省略参数（省略 = 宿主按全库数）
+  assert.equal(t.sessionScopeOf('session-a'), 'session-a')
+  assert.equal(t.sessionScopeOf(null), 'orphan')
+  assert.equal(t.badgeQuery('session-a'), '?sessionId=session-a')
+
+  // 源码层钉死：不得再读会话快照的 .current
+  assert.ok(!/getSnapshot\(\)\.current/.test(client), '不得再读 snapshot.current（DSH 没有这个字段）')
+  assert.ok(/retainedBy\.mainView/.test(client), '必须用 retainedBy.mainView 认当前会话')
+  assert.ok(client.includes('拿不到当前会话 id'), '解析不出会话时要有可见提示，而不是静默空列表')
+})
