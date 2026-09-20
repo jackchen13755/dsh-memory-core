@@ -164,4 +164,13 @@ test('当前会话解析：走官方口径 retainedBy.mainView，绝不再读幻
   assert.ok(!/getSnapshot\(\)\.current/.test(client), '不得再读 snapshot.current（DSH 没有这个字段）')
   assert.ok(/retainedBy\.mainView/.test(client), '必须用 retainedBy.mainView 认当前会话')
   assert.ok(client.includes('拿不到当前会话 id'), '解析不出会话时要有可见提示，而不是静默空列表')
+
+  // 更硬的一层：conversation.view 注册要带 inject(sessionKey) —— slot 给的 session key 才是
+  // 本面板所属会话的权威口径（ui-trajectory 同款），多会话同时打开时不会张冠李戴。
+  assert.ok(/inject:\s*\(sessionKey\)/.test(client), '注册要带 inject(sessionKey) 取本 view 的会话')
+  assert.ok(client.includes('viewSessionId'), '要把 viewSessionId 传给面板')
+  assert.match(client, /props && props\.viewSessionId/, '有 viewSessionId 时优先用它（不走全局猜测）')
+
+  // 队列 30s 自刷：会话提取/工具写入随时往队列放新条目，不重查就会"看着像没写进来"
+  assert.match(client, /setInterval\(\(\) => \{[\s\S]{0,220}?void load\(\)/, '待确认列表必须定时自刷（否则新写入的条目不出现）')
 })

@@ -286,6 +286,29 @@ test('空闲规划：游标未推进、轮次不足、未到空闲时间都不�
   closeDb(db)
 })
 
+test('长会话兜底：一直活跃的会话也能被自动提取（基准不能用 last_seen）', () => {
+  const { db, store } = fixture()
+  const sessionId = 's-busy'
+  noteSessionActivity({ store, sessionId, seq: 50, turns: 6 })
+  // 会话一直在活动：last_seen 刚刚刷新过（历史 bug 就是拿它当基准 → 永远够不到 30 分钟）
+  const live = new Map([[sessionId, { lastSeen: Date.now(), seq: 50, turns: 6, firstSeen: Date.now() - 100 * 60000 }]])
+  const due = planAutoExtract({ store, live, config: EXTRACT_DEFAULTS })
+  assert.equal(due.length, 1, '活跃了 100 分钟的会话应命中 max-wait（否则它永远不会被提取）')
+  assert.equal(due[0].reason, 'max-wait')
+  assert.equal(due[0].newTurns, 6)
+
+  // 刚开的会话不该被立刻提取（firstSeen 才 1 分钟）
+  const youngId = 's-young'
+  noteSessionActivity({ store, sessionId: youngId, seq: 5, turns: 3 })
+  const young = new Map([[youngId, { lastSeen: Date.now(), seq: 5, turns: 3, firstSeen: Date.now() - 60000 }]])
+  assert.equal(planAutoExtract({ store, live: young, config: EXTRACT_DEFAULTS }).length, 0)
+
+  // 提取后以「上次提取时间」为基准：30 分钟内不重复
+  markExtracted({ store, sessionId, cursor: 50, turns: 6 })
+  assert.equal(planAutoExtract({ store, live, config: EXTRACT_DEFAULTS }).length, 0)
+  closeDb(db)
+})
+
 test('routeOf：从会话 requestHeader 取模型路由', () => {
   assert.deepEqual(routeOf({ requestHeader: () => ({ config: { provider: 'tc-deepseek', model: 'm' } }) }), { provider: 'tc-deepseek', model: 'm' })
   assert.equal(routeOf({ requestHeader: () => ({}) }), null)

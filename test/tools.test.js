@@ -7,6 +7,7 @@ import { closeDb, migrate, openDb } from '../lib/db.js'
 import { Recall } from '../lib/recall.js'
 import { Store } from '../lib/store.js'
 import { buildTools, scopeForExec } from '../lib/tools.js'
+import { writeMemory } from '../lib/writer.js'
 import { compareVersions, SUPPORTED_DSH } from '../lib/host.js'
 
 function fixture() {
@@ -48,6 +49,28 @@ test('工具定义符合 dsh 0.1.5-rc.1 的注册契约', () => {
     const rendered = t.output.render({}, { text: 'x' })
     assert.ok(Array.isArray(rendered) && rendered[0].type === 'text', `${t.name} render 应返回 text 分段`)
   }
+  closeDb(db)
+})
+
+test('mem_write：回报里必须写清落点（track/scope/条目 id），不能只甩个 relation 词', async () => {
+  const { db, store, recall } = fixture()
+  // 与生产装配一致：写入走 runtime.writer（lib/index.js 里同一个入口）
+  const runtime = { writer: { writeMemory: (a) => writeMemory({ store, recall, ...a }) } }
+  const tools = buildTools({ store, recall, host: {}, config: {}, runtime })
+  const write = tools.find((t) => t.name === 'mem_write')
+  const exec = { agent: { session: { id: 's-tools', header: { cwd: '/tmp/tools-proj' } } } }
+
+  const direct = await write.execute({ content: '项目进展：分支列表的悬停高亮做完了。', track: 'project', kind: 'progress' }, exec)
+  assert.equal(direct.status, 'written')
+  assert.match(direct.text, /^已写入 \[mem:[0-9a-f]{8}\]（track=project · scope=project:[0-9a-f]{12}）/, `实际：${direct.text}`)
+  assert.ok(!/unrelated|related/.test(direct.text), '不得把 relation 当成说明文案贴上去')
+
+  const queued = await write.execute({ content: '规则：提交前必须跑 node --test 全量。', track: 'memory', kind: 'rule' }, exec)
+  assert.equal(queued.status, 'queued')
+  assert.match(queued.text, /^已进待确认队列（建议 [0-9a-f]{8}）（track=memory · scope=global）/, `实际：${queued.text}`)
+  assert.match(queued.text, /确认后才会注入上下文/)
+  // 归属会话要落到本会话（面板「本会话」才看得到）
+  assert.equal(store.db.prepare('SELECT session_id FROM suggestions WHERE id = ?').get(queued.id)?.session_id, 's-tools')
   closeDb(db)
 })
 
