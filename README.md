@@ -246,6 +246,32 @@ node --test test/                 # 单测
 - **成本**：每轮零 LLM 调用（自动蒸馏默认关）；LLM 只用于演化与可选查询扩展
 - **铁律**：结构化输出的 LLM 调用必须显式声明推理档位 + 充足预算 + 失败留痕 + 失败可见（教训来自 dsh-memgas issue #1）
 
+## 检索与写入强化（P0/P1 七项 · 对标 Hindsight，v0.0.14）
+
+| # | 能力 | 落点 | 默认 | 关掉 / 回退 |
+|---|---|---|---|---|
+| 1 | RRF 之后的**乘性加权层**：四信号（recency / importance / usage / proof），`score' = rrf × Π(1+α(signal−0.5))`；只改总榜排序，**不打穿基线保底席位** | `lib/recall.js` | 开 | `boosts.enabled=false` → 与改造前逐查询等价（有可执行对照钉住） |
+| 2 | **注入 token 预算装箱**：装不下就跳过并继续装后面的行；一条都装不下时保底截断输出首条 | `lib/inject.js` | 开 | 无开关（旧行为是「超预算即 break」） |
+| 3 | **时间维度**：`units.occurred_at`（schema **v4**，可空增量列 + 索引）、时序召回通道（C5）、时间窗口解析（今天/昨天/本周/上个月/最近 N 天/YYYY-MM-DD…） | `lib/schema.js` `lib/recall.js` `lib/extract.js` `lib/tools.js` | 开 | `channels.temporal.enabled=false` |
+| 4 | **巩固证据 proof_count**：abstract 条目按 `derivedFrom` 入边数取 proof 信号 | `lib/recall.js` | 开 | `boosts.proofAlpha=0` |
+| 5 | **实体归一化匹配**：全角折叠、`\`↔`/`、空白折叠、大小写（`normalizeEntity` / `entityMatches`） | `lib/entities.js` `lib/recall.js` | 开 | 无开关（`extractEntities` 既有行为未变） |
+| 6 | **写入侧提示注入检测**：`scanInjection`，high 拒写 / medium 转待确认；新建、采纳、**编辑**（工具面 + 面板）三条路都过 | `lib/writer.js` `lib/tools.js` `lib/api.js` | 开 | 无开关 |
+| 7 | **抽取倾向 `retain_mission`** + `mem_write` / `mem_update` 支持显式 `occurredAt` | `lib/extract.js` `lib/tools.js` | `mission` 为空 = 提示词与旧版**逐字一致** | 不配即旧行为 |
+
+**不劣化证据（现测）**
+
+- `node --test test/` = **218/218 green**（改造前基线 115）
+- `boosts.enabled=false` 与改造前实现**逐条**比 id/rank/rrf 一致：测试运行时从固定基线提交 `51f966e` 取回旧 `recall.js` import 对照（另附一份录制自旧实现的 golden，基线取不到时对照会**显式失败**而非静默跳过）
+- 同一快照 A/B 命中率不劣化：已迁移 v4 的库上 **20/24 vs 20/24**，命中集合与 top-5 序列 0/24 差异
+- 硬约束：**零常驻 LLM 成本**（新增路径全是正则 + SQL + 算术，无 fetch/模型调用）、**Markdown 事实源零迁移**（`occurred_at` 是可空增量列，既有文件形态与往返字节不变）
+- 写入侧筛查的三条路径与写入层同构（先 `String()` 再筛），并各有回归用例；测试用「定点变异」验证过：把任一修复退回旧写法，对应用例即失败
+
+**已知取舍（明文备案，别当成已解决）**
+
+- **评测面盲区**：既有 24 条标注集对**实体归一化**零敏感 —— `extractEntities()` 只认反引号/带分隔符的片段，那批查询全是裸单词，抽取恒为 `[]`，该通道在这批查询上是死代码。它的收益只能在能力级用例上复现（全角折叠 / `\`↔`/` / 空白折叠三种写法：旧实现漏、现行命中），**标注集测不出**。
+- **加权层净 −1（已接受）**：archive-restored 视图 19/24 vs 20/24（掉 2 得 1，被重排序挤出）；as-is 视图反而净 +1。按视图分开记录，详见 `lib/recall.js` 的「基线已知回退清单」注释。
+- **同步信任边界**：`changes/*.jsonl` 视为**本机可信输入**，导入路径不做内容筛查（能被改写该文件的人同样能直接改库）；写入侧筛查落在 writer 的新建/采纳与 tools/api 的编辑路径上。若同步源将来变成不可信，必须补筛查（见 `lib/sync.js` 文件头）。
+
 ## 里程碑
 
 | 里程碑 | 内容 | 关键验收 |

@@ -64,10 +64,18 @@ test('待办：智能视图只给需要关注的（逾期 / 今日到期 / 本�
 test('待办：每日过往查询需要 past + expired（旧工具的坑）', () => {
   const { db, todos } = fixture()
   const yesterday = day(-1)
-  todos.add({ content: '昨天没做完的事', track: 'daily', date: yesterday })
-  todos.add({ content: '昨天做完的事', track: 'daily', date: yesterday })
-  const [a, b] = todos.list({ track: 'daily', day: yesterday, all: true })
-  todos.done(b.id)
+  const stale = todos.add({ content: '昨天没做完的事', track: 'daily', date: yesterday })
+  const finished = todos.add({ content: '昨天做完的事', track: 'daily', date: yesterday })
+  // created_at 显式置为不同毫秒：把排序钉死在**契约**上（due 升序、created_at 降序），
+  // 不再依赖「两次 add 恰好落在同一毫秒」这种计时巧合 —— 那正是本用例 flake 的来源。
+  db.prepare('UPDATE todos SET created_at = ? WHERE id = ?').run(Date.now() - 60000, stale.id)
+  db.prepare('UPDATE todos SET created_at = ? WHERE id = ?').run(Date.now(), finished.id)
+
+  // 主排序 created_at DESC → 较新的「昨天做完的事」在前；同 due 时该顺序确定（不再随机）。
+  const [first] = todos.list({ track: 'daily', day: yesterday, all: true })
+  assert.equal(first.content, '昨天做完的事', '同 due 时按 created_at DESC 定序（契约）')
+
+  todos.done(finished.id)
 
   assert.equal(todos.list({ past: true }).length, 0, '只带 past 看不到未完成的过期遗留（默认被隐藏）')
   const withExpired = todos.list({ past: true, expired: true })
