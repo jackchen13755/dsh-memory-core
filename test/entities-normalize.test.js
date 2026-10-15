@@ -9,8 +9,14 @@
  *   - extractEntities 既有行为不回归（抽取规则、返回顺序、limit 截断原样）。
  */
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
+import { closeDb, migrate, openDb } from '../lib/db.js'
 import { entityMatches, extractEntities, normalizeEntity } from '../lib/entities.js'
+import { Recall } from '../lib/recall.js'
+import { Store } from '../lib/store.js'
 
 /** 归一化必须收敛：折一次和折两次结果相同。 */
 function assertIdempotent(input) {
@@ -153,4 +159,87 @@ test('抽出来的实体能被归一化匹配（两个新导出的联动）', ()
   assert.equal(entityMatches('pnpm test', doc), true)
   assert.equal(entityMatches('BUG12345', doc), true)
   assert.equal(entityMatches('/Users/Bob/Other/src/App.js', doc), false)
+})
+
+/**
+ * M2：C2 的实体归一化缓存。
+ *
+ * 两道判据：
+ *   ① **缓存来源**：清空文档侧的归一化缓存后，实体加分量必须消失 → 证明通道读的是缓存
+ *      （旧实现读 `[...doc.ents]`，清空它才会掉分）；
+ *   ② **语义等价**：实体加分量必须与旧实现（`entityMatches` + 现折精确判定）**逐条同值**
+ *      —— 改成缓存最容易悄悄改掉的就是 +4 / +1.5 两档的判定顺序。
+ */
+test('稀疏通道：实体归一化走 build 缓存，且加分量与旧实现逐条同值', () => {
+  const db = openDb(join(mkdtempSync(join(tmpdir(), 'memcore-ents-cache-')), 'mem.db'))
+  migrate(db)
+  const store = new Store(db)
+  const content = '组件 `@/components/Foo/index.vue` 与 `pnpm test`，路径 `C:\\Users\\Alice\\Project`。'
+  // meta.ent 由写入侧（writeMemory）抽取后落库，这里按同形状手工给出，保证语料里有实体可比
+  const unit = store.insertUnit({ track: 'memory', scope: 'global', content, meta: { ent: extractEntities(content) } })
+  const recall = new Recall(store)
+  const doc = recall.corpus.ensure().docs.get(unit.id)
+
+  // 缓存本身：归一化后的键（全角/大写/分隔符都折过），且空键被滤掉
+  assert.deepEqual(
+    doc.entsNorm,
+    extractEntities(content)
+      .map((e) => normalizeEntity(e))
+      .filter(Boolean),
+  )
+  assert.ok(doc.entsNorm.includes('@/components/foo/index.vue'), '组件路径要折成规范键')
+  assert.ok(doc.entsNorm.includes('/users/alice/project'), '盘符路径要折成同一个键')
+  assert.ok(!doc.entsNorm.includes(''), '空键必须滤掉（空键参与 includes 会把一切都匹配上）')
+
+  /** 旧实现的实体加分量（对照基准，逐条搬自改造前的 channelSparse）。 */
+  const legacyBonus = (queryEntities) => {
+    const docEnts = [...doc.ents]
+    let bonus = 0
+    for (const raw of queryEntities) {
+      if (!entityMatches(raw, docEnts)) continue
+      const q = normalizeEntity(raw)
+      bonus += docEnts.some((e) => normalizeEntity(e) === q) ? 4 : 1.5
+    }
+    return bonus
+  }
+  const scoreOf = (query) => recall.channelSparse(query, { scopes: 'all', limit: 10 }).find((h) => h.id === unit.id)?.score ?? 0
+
+  // 先钉住「这三个查询各自只抽出 1 个实体」，下面的量级断言才有确定含义
+  const exactQ = '`Ｃ：＼ＵＳＥＲＳ＼ＡＬＩＣＥ＼ＰＲＯＪＥＣＴ` 怎么配？' // 全角大写 + 反斜杠 → 折成同一个键
+  const partialQ = '/Users/Alice 下的配置'
+  const missQ = '/Users/Bob 下的配置'
+  assert.deepEqual(extractEntities(exactQ), ['Ｃ：＼ＵＳＥＲＳ＼ＡＬＩＣＥ＼ＰＲＯＪＥＣＴ'])
+  assert.deepEqual(extractEntities(partialQ), ['/Users/Alice'])
+  assert.deepEqual(extractEntities(missQ), ['/Users/Bob'])
+
+  const cases = [
+    [exactQ, 4, '全角大写写法 → 归一化后精确命中'],
+    [partialQ, 1.5, '父路径 → 部分包含命中'],
+    [missQ, 0, '无关路径不命中'],
+    // 多实体（还会带出派生实体 index.vue）：只断言与旧实现同值，不硬编码量级
+    ['`@/components/Foo/index.vue` 与 /Users/Alice', null, '多实体叠加'],
+  ]
+  for (const [query, expect, why] of cases) {
+    const queryEntities = extractEntities(query)
+    const bonus = legacyBonus(queryEntities)
+    if (expect !== null) assert.equal(bonus, expect, `${why}：旧实现的期望加分量应为 ${expect}`)
+    else assert.ok(bonus > 4, `${why}：多实体应叠加（实测 ${bonus}）`)
+    const withCache = scoreOf(query)
+    const saved = doc.entsNorm
+    doc.entsNorm = [] // 只清缓存，不动 doc.ents
+    const withoutCache = scoreOf(query)
+    doc.entsNorm = saved
+    assert.equal(
+      Math.round((withCache - withoutCache) * 100) / 100,
+      Math.round(bonus * 100) / 100,
+      `${why}：实际加分量应等于旧实现（${withCache} - ${withoutCache} vs ${bonus}）`,
+    )
+  }
+
+  // 清空原始 ents（旧实现的数据源）后，缓存命中不受影响 → 通道确实读缓存
+  const q = '／ＵＳＥＲＳ／ＡＬＩＣＥ／ＰＲＯＪＥＣＴ'
+  const before = scoreOf(q)
+  doc.ents.clear()
+  assert.equal(scoreOf(q), before, '清空原始 ents 后分数不变 → 说明 C2 命中的是 entsNorm 缓存')
+  closeDb(db)
 })
