@@ -227,3 +227,32 @@ test('约束上限：一轮最多 8 条（pin 的永不回收，必须从源头�
   assert.ok(constraints.length <= 8, `约束数应 ≤8，实际 ${constraints.length}`)
   assert.ok(constraints.every((n) => n.pin === 1))
 })
+
+test('代码/测试碎片不得被抽成进度节点', () => {
+  const noise = [
+    '" yields content "已提交并推送完成。',
+    'cleanLine strips 进度: → extractNodes on "- 进度: 已提交并推送完成。',
+    "assert.equal(nodes[0].content, '已提交并推送完成。')",
+  ]
+  for (const line of noise) {
+    assert.equal(classifyText(line).length, 0, `不应抽成节点：${line}`)
+  }
+})
+
+test('骨架块被引用在更大消息里也要排除（includes 而非 startsWith）', async () => {
+  const { readTranscript } = await import('../lib/session-log.js')
+  const session = {
+    id: 'q1',
+    header: { id: 'q1' },
+    ownEvents: () => [
+      { type: 'user/message', seq: 1, data: { content: [{ type: 'text', text: '正常消息：已提交并推送完成。' }] } },
+      {
+        type: 'user/message',
+        seq: 2,
+        data: { content: [{ type: 'text', text: '我引用一下那段：\n[会话骨架] 以下为…\n- 进度: 已提交并推送完成。' }] },
+      },
+    ],
+  }
+  const { messages } = readTranscript(session, { maxMessages: 10 })
+  assert.equal(messages.length, 1, `引用骨架的消息也应被排除，实际保留 ${messages.length} 条`)
+})

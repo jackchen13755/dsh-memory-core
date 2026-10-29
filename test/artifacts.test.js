@@ -162,3 +162,34 @@ test('N1：反引号包裹的路径不得产生尾反引号变体（否则永远
   assert.equal(JSON.parse(store.getMeta(`artifact:${unit.id}`, '{}')).state, 'ok')
   closeDb(db)
 })
+
+test('N3：中文注释紧贴路径不得被吃进路径（假 missing 的头号来源）', () => {
+  const cases = [
+    '/Users/x/.dsh/profiles/desktop/cordis.yml`（组合快照总条目',
+    '/Users/x/.dsh/profiles/desktop/compatibility.json`（按宿主版本逐条的豁免台账',
+    '~/Desktop/proj/report.md（260 行，含图表',
+  ]
+  for (const line of cases) {
+    const got = candidatePaths(line)
+    assert.ok(!got.some((p) => /[\u4e00-\u9fff（）：；，。」]/.test(p)), `路径里不该含中文/全角标点：${JSON.stringify(got)}`)
+  }
+})
+
+test('N3：无扩展名（真实路径含空格被截断）与文档占位符都不认', () => {
+  assert.equal(candidatePaths('/Users/x/Library/Application').length, 0, '被空格截断的路径不认')
+  assert.equal(candidatePaths('/Users/x/.dsh/profiles/<profile>/node_modules').length, 0, '占位符不认')
+  assert.equal(candidatePaths('/Users/x/.dsh/sessions/.../session.v4.jsonl.zstd').length, 0, '省略号占位符不认')
+})
+
+test('N3：正常路径仍然保留（不过度收紧）；裸文件名因有歧义而不认', () => {
+  const got = candidatePaths('改动在 `lib/schema.js`，另见 `src/a/b.ts`。')
+  assert.ok(got.includes('lib/schema.js'), `实际：${JSON.stringify(got)}`)
+  assert.ok(got.includes('src/a/b.ts'))
+  // 裸 `package.json` 机器上几十个，拿 cwd 猜会误判，所以不认
+  assert.ok(!candidatePaths('配置见 `package.json`。').includes('package.json'))
+})
+
+test('N3：glob 通配符不是具体文件，不参与指纹', () => {
+  assert.equal(candidatePaths('/Users/x/Desktop/figma-exports/*.ws.json').length, 0, 'glob 不认')
+  assert.equal(candidatePaths('/Users/x/docs/*.md').length, 0, 'glob 不认')
+})
