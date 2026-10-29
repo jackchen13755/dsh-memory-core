@@ -53,10 +53,10 @@ test('v4 迁移：v3 老库升级后新增 occurred_at 列与 units_occurred 索
 
     const res = migrate(db)
     assert.equal(res.from, 3)
-    assert.equal(res.to, 4)
-    assert.equal(res.applied, 1, '只应用 v4 一个迁移')
+    assert.equal(res.to, SCHEMA_VERSION)
+    assert.equal(res.applied, 2, 'v3 老库一次升到当前版本：v4 时间维度 + v5 会话骨架')
     assert.equal(res.target, SCHEMA_VERSION)
-    assert.equal(SCHEMA_VERSION, 4, 'SCHEMA_VERSION 必须同步递增')
+    assert.equal(SCHEMA_VERSION, 5, 'SCHEMA_VERSION 必须同步递增')
 
     // 列：INTEGER、可 NULL
     const cols = db.prepare('PRAGMA table_info(units)').all()
@@ -89,13 +89,13 @@ test('v4 迁移幂等：重复 migrate 不报错、版本稳定、quick_check ok
   const db = tmpDb()
   try {
     const first = migrate(db)
-    assert.equal(first.to, 4)
+    assert.equal(first.to, SCHEMA_VERSION)
     insertLegacyUnit(db)
 
     for (const round of [1, 2, 3]) {
       const again = migrate(db)
       assert.equal(again.applied, 0, `第 ${round} 次重复迁移不应再应用任何迁移`)
-      assert.equal(again.to, 4, `第 ${round} 次重复迁移后版本仍应是 4`)
+      assert.equal(again.to, SCHEMA_VERSION, `第 ${round} 次重复迁移后版本仍应是当前版本`)
     }
 
     const cols = db.prepare('PRAGMA table_info(units)').all().filter((c) => c.name === 'occurred_at')

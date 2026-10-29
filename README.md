@@ -17,7 +17,11 @@ node bin/mem.js extract                       # 会话提取账本（游标/空�
 node bin/mem.js extract --session <id> --show # 离线会话：读回 zstd 多帧日志 + 预览提取提示词
 ```
 
-模型侧工具（共 8 个）：`mem_search` · `mem_get` · `mem_diag` · `mem_status` · **`mem_write`** · **`mem_update`** · **`mem_review`** · **`mem_extract`**。
+模型侧工具（共 12 个）：`mem_search` · **`mem_recall`** · `mem_get` · `mem_diag` · `mem_status` · **`mem_write`** · **`mem_update`** · **`mem_review`** · **`mem_extract`** · `mem_prompts` · `mem_todo` · `mem_skill`。
+
+> `mem_recall` 是**显式**的两层回捞：先查本次会话的骨架节点（约束/决策/进度）及一跳邻居，命中不足 2 条时
+> 自动翻会话原文（含历史片段），每条结果标 `source=node` / `source=span`。它**不进**自动注入——按轮翻原文会
+> 违反 per-turn ≤400 token 与「连续 5 轮空转停」两条省 token 设计。设计取舍见 [docs/BORROW-FROM-SOUL.md](docs/BORROW-FROM-SOUL.md)。
 
 | 能力 | 行为 |
 |---|---|
@@ -163,10 +167,52 @@ CLI：`mem todo list|add|done|update|remove|remind|stats|export`、`mem skill li
 | 段 | 内容 | 预算 | 触发 |
 |---|---|---|---|
 | **常驻段** `memory-core:resident` | ① 规则/偏好类记忆（`kind ∈ {rule, preference}` 或 pin）② **索引目录**（未常驻条目的一行标题，按 key→memory→user→project→daily 排优先级，daily 限量） | ≤1200 token（实测 **1055**） | 每步组装；内容不变则零成本 |
+| **会话骨架** `memory-core:skeleton`（order 605） | 本次会话已确认的**约束 / 决策 / 进度**（零模型机械抽取，约束置 pin 优先）。补的是「压缩之后这轮定了什么没有恢复路径」——这类决策既不是规则，也没有 query 能命中 | ≤220 token（`config.skeleton.budgetTokens`） | 每步组装；**全序确定性投影**（同一图状态必得同一字节串，避免每轮抖动触发宿主追加）；图空发空串 |
 | **按轮卡片** `memory-core:recall` | 用**本轮用户消息**检索，证据达标才注入 ≤3 张卡片（id + 摘要 + `mem_get` 提示） | ≤400 token（实测 **253**） | 每轮一次；同轮内保持稳定，跨轮按 id 去重，连续 5 轮无命中停止 |
 
 > 关键机制：dsh 的运行时快照**按内容去重**——文本不变就不会追加消息；且提示词组装发生在
 > `agent/pre-step` **之前**，所以按轮卡片的 query 由 `session/event` 的 `user/message` 先缓存。
+
+### 会话骨架：补「压缩之后想不起这轮定了什么」
+
+常驻段只放 `rule` / `preference`，按轮卡片是 **query 驱动**。于是「我们决定用 anchor 而不是摘要，因为摘要会丢约束」
+这类**决策**：它不是规则，也没有任何 query 能命中它——压缩一擦就没了。骨架补的正是这一层。
+
+- **零模型调用**：`lib/skeleton.js` 用显式词表机械抽取三类节点（`constraint` / `decision` / `progress`），纯函数可单测；
+- **触发点** `agent/turn-stopping`（每回合收口一次）。**不挂** `tools/post-execute`——那个瀑布在工具链里被 await
+  且无内建超时，监听器抛错会把该次工具结果变成 `isError`；
+- **独立段独立预算**：`memory-core:skeleton` order 605、默认 220 token。**不并入规则段**，否则状态会挤掉 600 的规则预算；
+- **确定性投影**：排序键 = `pin` → kind 秩 → `content_hash` → `id`，全序，同一图状态必得同一字节串；
+- **会话级派生态**：`nodes` 表不进 `sync` 的 `ENTITIES`、不进 Markdown 快照、不进 `suggestions` 队列。丢了能从会话重算。
+
+配置（`cordis.patch.yml` 的 `config`）：
+
+```yaml
+- id: dsh-memory-core
+  config:
+    skeleton:
+      enabled: true          # 关掉骨架：false
+      budgetTokens: 220      # 0 = 关段（与按轮卡片同一约定）
+      maxMessages: 20        # 只看最近多少条消息，再往前早被压掉了
+      allowDiskFallback: false  # 活体事件为空时是否读落盘日志（实测 150ms 同步阻塞，默认关）
+    skeletonOrder: 605
+```
+
+### 队列支持度与产物失效（同期加入）
+
+- **支持度**：同一件事被**再次**提出时 `support += 1`（去重键只取 `kind + target + 内容哈希`，
+  所以换个会话提也算同一件事）。队列按 `support` 排序；**两档宽限**：普通建议 14 天归档，
+  `support >= 3` 的给 90 天（按最后出现时间算）——「反复提过」只换来更长的宽限，不是永久免疫。
+  原来「用户纠正了三次」和「一次性噪声」完全同权。
+- **产物失效**：记忆里提到的文件会留 sha1，后台巡演核对后记 `ok / changed / missing`，
+  统计进 `mem_status`（`产物证据：…`）。**advisory only**：不改权重、不归档、不删除，也不进检索热路径。
+  状态存在 **meta 表**（`artifact:<unitId>`）而**不是** `units.meta`——后者的 sync 整列替换，
+  写进去会把本机路径与文件哈希同步到别的设备。
+  路径有栅栏：只核 home/cwd 内、拒软链、跳过 `.ssh`/`.aws`/`.env` 等敏感目标、单文件 ≤256KB、
+  每轮总读 ≤8MB；相对路径没有 cwd 时**不判**（`config.evolve.artifactCwd` 配成项目根即可覆盖
+  `lib/schema.js` 这类相对写法，默认 null 只核绝对路径与 `~/`）。
+
+完整取舍（含被拒方案与理由）见 [docs/BORROW-FROM-SOUL.md](docs/BORROW-FROM-SOUL.md)。
 
 ## M2 验收证据（2026-09-15）
 

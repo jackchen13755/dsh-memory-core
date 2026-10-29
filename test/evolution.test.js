@@ -36,6 +36,37 @@ test('强化：被召回过的条目加权，同批召回建 coRetrieval 边', (
   closeDb(db)
 })
 
+test('强化消费水位：同一条激活跨多轮巡演只计一次（importance / access_count 不再虚高）', () => {
+  const { db, store } = fixture()
+  const a = store.insertUnit({ track: 'memory', scope: 'global', kind: 'rule', content: '规则C：推送前做隐私扫描。' })
+  store.db.prepare('UPDATE units SET importance = 0.2, access_count = 0 WHERE id = ?').run(a.id)
+  const ins = store.db.prepare(
+    'INSERT INTO recall_log (ts, session_id, query, unit_id, channel, rank, score, injected, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  )
+  ins.run(Date.now(), 's1', '推送 隐私', a.id, 'lexical', 1, 0.9, 1, null)
+
+  const first = reinforce({ store })
+  assert.equal(first.boosted, 1, '首次巡演应强化')
+  const afterFirst = Number(store.getUnit(a.id).importance)
+  const countFirst = Number(store.getUnit(a.id).access_count)
+  assert.ok(afterFirst > 0.2)
+  assert.equal(countFirst, 1)
+
+  // 30 分钟后第二轮巡演：日志没有新行，不得再次计入同一批激活
+  const second = reinforce({ store, now: Date.now() + 30 * 60000 })
+  assert.equal(second.boosted, 0, '没有新激活就不该再强化')
+  assert.equal(Number(store.getUnit(a.id).importance), afterFirst, 'importance 不得重复累加')
+  assert.equal(Number(store.getUnit(a.id).access_count), countFirst, 'access_count 不得虚高')
+
+  // 新激活照常计入
+  ins.run(Date.now() + 2, 's1', '推送 隐私', a.id, 'lexical', 1, 0.9, 1, null)
+  const third = reinforce({ store, now: Date.now() + 60 * 60000 })
+  assert.equal(third.boosted, 1, '新激活应照常强化')
+  assert.ok(Number(store.getUnit(a.id).importance) > afterFirst, '新激活应继续加权')
+  assert.equal(Number(store.getUnit(a.id).access_count), countFirst + 1)
+  closeDb(db)
+})
+
 test('衰减：按半衰期下降，低于阈值转 archived；pin 豁免；只归档不删除', () => {
   const { db, store } = fixture()
   const old = store.insertUnit({ track: 'memory', scope: 'global', kind: 'fact', content: '很久没用的旧事实。' })

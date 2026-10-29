@@ -36,7 +36,7 @@ test('工具定义符合 dsh 0.1.5-rc.1 的注册契约', () => {
   const tools = buildTools({ store, recall, host: { version: '0.1.5-rc.1', caps: {} }, config: {} })
   assert.deepEqual(
     tools.map((t) => t.name),
-    ['mem_search', 'mem_get', 'mem_diag', 'mem_status', 'mem_write', 'mem_update', 'mem_review', 'mem_extract', 'mem_prompts', 'mem_todo', 'mem_skill'],
+    ['mem_search', 'mem_recall', 'mem_get', 'mem_diag', 'mem_status', 'mem_write', 'mem_update', 'mem_review', 'mem_extract', 'mem_prompts', 'mem_todo', 'mem_skill'],
   )
   for (const t of tools) {
     assert.equal(typeof t.name, 'string')
@@ -88,7 +88,9 @@ test('mem_search：命中 + 渲染文本 + 证据标记', async () => {
 
 test('mem_get：取全文并累加访问计数；缺失 id 不抛', async () => {
   const { db, store, recall } = fixture()
-  const [, get] = buildTools({ store, recall, host: {}, config: {} })
+  // 按名取，不用位置解构：工具顺序会随新工具插入而变化（mem_recall 就插在 mem_search 之后）
+  const tools = buildTools({ store, recall, host: {}, config: {} })
+  const get = tools.find((t) => t.name === 'mem_get')
   const [row] = store.listUnits({ track: 'memory' })
   const out = await get.execute({ id: `${row.id},deadbeef` }, {})
   assert.deepEqual(out.found, [row.id])
@@ -101,12 +103,13 @@ test('mem_get：取全文并累加访问计数；缺失 id 不抛', async () => 
 
 test('mem_status：报出宿主版本与分轨计数', async () => {
   const { db, store, recall } = fixture()
-  const [, , , status] = buildTools({
+  const tools = buildTools({
     store,
     recall,
     host: { version: '0.1.5-rc.1', supported: SUPPORTED_DSH, compatible: true, caps: { tools: true }, latestBackup: null },
     config: {},
   })
+  const status = tools.find((t) => t.name === 'mem_status')
   const out = await status.execute({}, {})
   assert.equal(out.counts.units, 2)
   assert.equal(out.host.version, '0.1.5-rc.1')
