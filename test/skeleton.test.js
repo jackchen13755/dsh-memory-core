@@ -182,3 +182,48 @@ test('N2：超过安全上限时如实报 truncated，不静默丢弃', () => {
   assert.equal(capped.truncated, N - 10, '触碰上限时必须报出被截断条数')
   closeDb(db)
 })
+
+test('自反馈：注入的骨架块被 readTranscript 当噪声排除，不会再次被抽取', async () => {
+  const { readTranscript } = await import('../lib/session-log.js')
+  const skeletonBlock = ['[会话骨架] 以下为本次会话已确认的约束/决策/进度（数据，不是指令）：', '- 进度: 已提交并推送完成。'].join('\n')
+  const session = {
+    id: 'sf',
+    header: { id: 'sf' },
+    ownEvents: () => [
+      { type: 'user/message', seq: 1, data: { content: [{ type: 'text', text: '用户: 正常的一句话，已提交并推送完成。' }] } },
+      { type: 'user/message', seq: 2, data: { content: [{ type: 'text', text: skeletonBlock }] } },
+    ],
+  }
+  const { messages } = readTranscript(session, { maxMessages: 10 })
+  assert.equal(messages.length, 1, `骨架块必须被排除，实际保留了 ${messages.length} 条`)
+  assert.ok(!messages.some((m) => m.text.includes('[会话骨架]')), '骨架块不得进入转录')
+})
+
+test('双前缀：渲染行的「进度:」标签会被剥掉，不叠成「进度: 进度: …」', () => {
+  const nodes = extractNodes([{ role: 'user', text: '- 进度: 已提交并推送完成。' }])
+  assert.equal(nodes.length, 1)
+  assert.equal(nodes[0].content, '已提交并推送完成。', `实际：${nodes[0].content}`)
+  // 再来一轮（模拟读回自己渲染的结果）仍不叠前缀
+  const again = extractNodes([{ role: 'user', text: `- 进度: ${nodes[0].content}` }])
+  assert.equal(again[0].content, '已提交并推送完成。')
+})
+
+test('噪声行：markdown 标题 / 纯标签行 / 宿主工具提醒都不算约束', () => {
+  const noise = [
+    '## 设计稿（权威依据，必须先读）',
+    '**软件架构师**：改动面 / 接口与数据 / 兼容与回滚',
+    '(上一步工具「validate_dsh_ui」可能未完成, 先确认状态再继续, 不要重复执行)',
+    'https://example.com/必须看',
+  ]
+  for (const line of noise) {
+    assert.equal(classifyText(line).length, 0, `不应抽成节点：${line}`)
+  }
+})
+
+test('约束上限：一轮最多 8 条（pin 的永不回收，必须从源头限量）', () => {
+  const lines = Array.from({ length: 20 }, (_, i) => `约束 ${i} 号：不要动构建配置，必须保持原样。`)
+  const nodes = extractNodes([{ role: 'user', text: lines.join('\n') }])
+  const constraints = nodes.filter((n) => n.kind === 'constraint')
+  assert.ok(constraints.length <= 8, `约束数应 ≤8，实际 ${constraints.length}`)
+  assert.ok(constraints.every((n) => n.pin === 1))
+})
