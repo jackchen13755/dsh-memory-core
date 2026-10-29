@@ -128,3 +128,25 @@ test('版本比较：能判定宿主是否满足声明下限', () => {
   assert.ok(compareVersions('0.1.5', '0.1.5-rc.1') > 0)
   assert.ok(compareVersions('0.1.4', '0.1.5-rc.1') < 0)
 })
+
+test('输出契约：每个工具 execute 的返回字段必须都在 output.schema.properties 里（additionalProperties=false）', async () => {
+  const { db, store, recall } = fixture()
+  const tools = buildTools({ store, recall, host: { version: '0.1.5-rc.1', caps: {} }, config: {} })
+  const exec = { agent: { session: { id: 's-contract', header: { cwd: '/tmp/proj' } } } }
+  let checked = 0
+  for (const t of tools) {
+    const declared = new Set(Object.keys(t.output.schema.properties ?? {}))
+    const strict = t.output.schema.additionalProperties === false
+    if (!strict) continue
+    // 只跑无参/可安全调用的工具（写操作需要参数，跳过）
+    if (!['mem_status', 'mem_diag'].includes(t.name)) continue
+    const out = await t.execute({}, exec)
+    assert.ok(out && typeof out === 'object', `${t.name} 应返回对象`)
+    for (const key of Object.keys(out)) {
+      assert.ok(declared.has(key), `${t.name} 返回了未声明字段 "${key}"（宿主会报 invalid output 并让整个工具失败）`)
+    }
+    checked += 1
+  }
+  assert.ok(checked >= 2, `应至少校验 2 个无参工具，实际 ${checked}`)
+  closeDb(db)
+})
