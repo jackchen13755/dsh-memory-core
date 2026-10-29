@@ -26,7 +26,8 @@
   },
   "scripts": {
     "test": "node --test test/",
-    "cli": "node bin/mem.js"
+    "cli": "node bin/mem.js",
+    "verify": "node scripts/verify-features.mjs"
   },
   "dsh": {
     "bundle": {
