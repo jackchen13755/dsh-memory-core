@@ -273,6 +273,29 @@ dsh-mem unquarantine --all   # 确认是误杀 → 一键解除
 - **CLI 可直接验证**：`dsh-mem inject "查询" --threshold 0.9 --max-cards 2 [--first-turn-boost] [--budget 400]`。
   以前预览写死 `config: {}`，读者按 README 改配置后在 CLI 上根本看不出差别。
 
+**P1 收尾四项（v0.0.22）**：按顺序落地 P1-2 ~ P1-5。前三项默认关闭/只读，第四项默认开但有 kill switch。
+
+| 项 | 做什么 | 默认 | 真实数据依据 |
+|---|---|---|---|
+| **P1-2 再注入冷却** | `recall.reinjectAfterTurns`：`seen` 记轮次，隔够 N 轮且排名 ≤ `reinjectTopRank` 的卡片允许再注入（把"永久去重"降级成"一段时间不重复"） | `0` = 关闭（= 旧行为） | 旧行为是"注入过就本会话永久不再推"，P0-4 让 `seen` 跨重启保留后，永久去重变成永久沉默 |
+| **P1-3 β_judge** | 给 `mem_update` 追加**可选**参数 `trust`（-10..10）/`trustReason`，写入 `units.meta.beta`；`recall.showTrust` 打开后卡片头显示 `β=+8.0` | 参数不传则零影响；`showTrust: false` | 不新增工具、不做每轮强制评分（rofm 的"本轮必须完成"会挤占注意力预算）。β 只由**内容之外的判断者**给出，不能自证 |
+| **P1-4 通道可观测** | `mem_status` 报图通道是否静默 skip（coRetrieval 边数 vs `minEdges`）+ 近 N 天命中通道分布；新增 `dsh-mem channels [--limit N]` 采样真实 query，输出参与/跳过/**跳过原因**/异常 | 只读 | 实测：temporal 在 20 条真实 query 上 100% 跳过，原因全是「未解析出时间窗口」（设计内）；graph 有 2373 条 coRetrieval 边、正常在跑。**跳过必须分原因看**，否则会把设计内行为误判成故障 |
+| **P1-5 注入计数进 decay** | `meta` KV 记 `inject:count:<id>`；decay 的免归档判据改为 `access_count>0 OR 注入过` | **开**（`evolve.injectedCountsAsAccess: false` 可关回旧行为） | `access_count` 只由 `mem_get` 提升，**每轮自动注入不计数** → "天天被注入、从没被显式取回"的条目会被判"从未使用"而衰减归档。真实库当前受影响 **0 条**（无回归风险），历史上有 556 条被注入过 |
+
+**复核后收紧的三处（同一 v0.0.22）**：
+- **β 有来源校验**：只有 `betaSource === 'model'`（本机模型通过 `mem_update` 提交）且未被标 `untrusted` 的 β 才会显示；
+  同步/导入带进来的 β 一律降级为 `betaInbound`（只留档）—— 否则"β 不能自证"只是一句注释。
+- **注入计数带 90 天时间窗**（`evolve.injectedWindowDays`）：否则"被注入过一次"就等于终身免归档。
+- **跳过原因用白名单判定**（`isDesignIntendedSkip`）：`disabled`、`时间窗口「X」内无语义相关条目` 这类设计内跳过
+  不再被误报成"考虑关掉省预算"；通道异常单独告警。
+
+**P1-5 是本轮唯一默认改变行为的**：它只会**减少**归档（保留优先）。真实库实测当下没有条目正卡在归档线，所以今天不改变任何数据；
+一旦条目衰减到边缘，注入记录会把它拉住。不想要就把 `evolve.injectedCountsAsAccess` 设为 `false`。
+
+```sh
+dsh-mem channels --limit 30   # 谁在跑、谁一直静默跳过（含跳过原因）
+```
+
 **已知未修（如实备案）**：
 
 - `missedStreak` 是会话内终态：连续空转达阈值后，本会话后面**再相关的新问题也不会恢复召回**（旧行为，

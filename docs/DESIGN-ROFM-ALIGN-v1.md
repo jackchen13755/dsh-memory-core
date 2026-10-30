@@ -562,3 +562,67 @@ P0 落地后交给「代码审查工程师」与「验收测试工程师」复�
 
 **初版文档写错两处**（复核时被抓出）：① 声称"后两者（below-score-floor / all-seen）算未命中"，而代码里
 `all-seen` 一直是命中、`below-score-floor` 那一支在分母修正后不可达并被删除；② 没写 `cards-disabled`。
+
+---
+
+## 11. P1-2 ~ P1-5 收尾（v0.0.22，2026-10-30）
+
+### 11.1 四项与验收
+
+| 项 | 落点 | 默认 | 验收测试 |
+|---|---|---|---|
+| P1-2 再注入冷却 | `inject.js`：`seenAt`（id→轮次，**只存内存**）+ `seenBlocks()` 判据 + `reinjectAfterTurns` / `reinjectTopRank` | `0` 关闭 | 默认跨轮不重复；`=2` 时冷却到期**只允许 top1** 再来（top2 之后仍被挡） |
+| P1-3 β_judge | `tools.js` 的 `mem_update` 追加可选 `trust` / `trustReason` → `units.meta.beta*`；`inject.js` 的 `fmtBeta()` + `recall.showTrust` | 不传零影响；显示默认关 | 写 β 不丢原 meta（`ent`/`summary` 仍在）、越界拒绝且不改动、`null` 清除；`showTrust` 关→无 `β=`，开→`β=+8.0` |
+| P1-4 通道可观测 | `mem_status` 增 `channels` 字段与一行文本；`bin/mem.js` 新增 `channels` 子命令（采样真实 query，输出参与/跳过/原因/异常） | 只读 | 边数不足时显式报「静默 skip」，补够 `minEdges` 后报「在跑」 |
+| P1-5 注入计数进 decay | `inject.js` 的 `bumpInjectionCounts()`（写 `meta` KV `inject:count:<id>`）+ `evolution.decay()` 的 `accessed` 判据 | **开**，`evolve.injectedCountsAsAccess:false` 可关 | 注入过 + `access_count=0` 的条目 decay 后仍 `active`；没注入过的照常归档；kill switch 关掉即恢复旧行为 |
+
+### 11.2 实现中发现的真问题（不修会误导读数）
+
+1. **`mem_status` 的通道统计块引用了上一个 `try` 的块级变量 `days`** → `ReferenceError` 被自己的 `catch` 吞成
+   `{error:'probe-failed'}`，于是"通道状态"永远只报一句 error。已改为独立计算的 `chanDays`。
+   **教训**：宽 catch 会把"写错的作用域"伪装成"探测失败"，而探测失败恰好是个合法返回形状 —— 这种 bug 只有单测能抓。
+2. **`channels` 命令最初把 temporal 的 100% 跳过标成"考虑关掉省预算"** —— 但时序通道在"查询里没有时间词"时跳过是
+   **设计内行为**。现在按跳过原因分类，只对「超预算/冷启动/门槛不足/异常」这类"本该跑却没跑"告警。
+
+### 11.3 P1-5 默认开启的理由与影响面（本轮唯一默认改变行为的一项）
+
+- 理由：`access_count` 只由 `mem_get` / reinforce 提升，**自动注入完全不计数** —— 于是"天天被注入、用户从不显式取回"
+  的记忆在 decay 眼里是"从未使用"，importance 一路衰减到归档。这与"注入就是使用"的直觉相反。
+- 真实库只读实测：`active && access_count=0` 共 **73 条**，其中 `importance < 0.15`（已到归档线）的 **0 条** ——
+  今天不改变任何数据；历史上有 **556 条**被注入过，条目衰减到边缘时才会生效。
+- 风险与出口：只会**减少**归档（库可能变大），`evolve.injectedCountsAsAccess: false` 一键回到旧判据。
+
+### 11.4 默认值表（"默认中性"如何落实）
+
+| 项 | 默认 | 说明 |
+|---|---|---|
+| `recall.reinjectAfterTurns` | `0` | 0 = 永久去重 = 旧行为 |
+| `recall.reinjectTopRank` | `2` | 只在冷却开启时才有意义 |
+| `recall.showTrust` | `false` | 不显示 β，卡片头零额外字符 |
+| `recall.countInjections` | `true` | 只写 KV，不改变注入内容；关掉则 P1-5 无数据 |
+| `evolve.injectedCountsAsAccess` | `true` | **唯一默认改变行为**，见 11.3；有 kill switch |
+
+### 11.5 复核整改（第二轮，同一 v0.0.22）
+
+两位专家（代码审查工程师 / 验收测试工程师）复核后提出 8 条，采纳 7 条、驳回 1 条。逐条复核确认后修复：
+
+| # | 问题 | 修复 |
+|---|---|---|
+| M1 | **β 无来源校验** —— 同步/导入带进来的 `beta:10` 会被 `showTrust` 当成"可信事实"，而 README 却写着"β 不能自证"。任何能写 changes 日志的人都能给内容盖章 | 读侧要求 `betaSource === 'model'` 且 `untrusted !== true`；写侧（sync）把入站 β 降级为 `betaInbound`（只留档、不可显示） |
+| M3 | 同步的 LWW 整列覆盖会**抹掉本机 β** | `mergeScanMeta` 像保留 `local.scan` 一样保留 `local.beta*` |
+| M2 | β 只能写、**读不回来**（`mem_get` / `mem_search` 都不显示）→ 模型无法自查、人无法审计 | 两处都补 β（含 `betaReason`），判据与卡片显示同源 |
+| M5 | 注入计数**永不过期** → 注入过一次即终身免归档（历史 556 条）；KV 只增不减 | 计数存 `{n, at}`，读侧按 `evolve.injectedWindowDays`（默认 90 天）过滤；兼容早期裸数字 |
+| M4/M14 | 跳过原因分类器用黑名单 → `disabled`（用户主动关掉）被报"考虑关掉省预算"、`时间窗口「X」内无语义相关条目` 被报故障 | 改为**白名单** `isDesignIntendedSkip()`（白名单外一律可疑，方向偏安全）；异常单独告警（异常时 skipped 为空、跳过率是 0，原判据永远走不到） |
+| ① | `seen` 持久而 `seenAt` 只存内存 → 重启后锚点取 0，**刚推过的卡片会立刻再推一次** | `seenAt` 缺失时按"刚刚看过"锚定（宁可少推） |
+| M11 | `beta` 的 null/undefined 守卫被削弱后，无 β 条目会渲染成 `β=0.0`（与"不给默认 β"相反） | 保留双守并补测试 |
+
+**驳回 1 条**：专家建议"归档时清理 `inject:count:` 键" → 与仓库既有的架构级守卫
+`t8 不新增删除路径（自愈只改 status，绝不 DELETE/DROP）` 冲突。改为**不删**：decay 只扫 `status='active'`，
+归档条目的键再也读不到；读侧还有时间窗。两重机制已经够，不该为省几行 meta 破坏那条纪律。
+
+**实现中又抓到一个同型 bug（本轮主题的第二次复发）**：`mergeScanMeta` 的最后一个 return 会
+"没改过就原样返回入站字符串"，把前面的 β 消毒整段丢弃 —— 消毒写对了却**没生效**。
+现在用 `touched` 标记区分"真的没动过"与"动过就得序列化"。
+
+**验收**：349 项测试全绿；本轮共 **13 个回退变异全部 CAUGHT**（7 个针对四项功能 + 7 个针对上述守卫，含
+"删掉 schema 里的 trust 参数"这种"功能假死但测试全绿"的洞）。

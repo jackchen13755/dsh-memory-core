@@ -11,6 +11,7 @@
  *   dsh-mem restore --from <快照目录> [--db <新库路径>]
  *   dsh-mem unquarantine [--id <id[,id]>] [--all]   # 解除隔离（只隔离不删除的可逆出口）
  *   dsh-mem rescan [--dry-run] [--limit N]          # 存量补扫：对现有条目跑一遍分级
+ *   dsh-mem channels [--limit 30]                   # 通道采样：谁在跑、谁一直静默跳过
  *   dsh-mem sql "<query>"
  *
  * 通用参数：`--db <路径>` 覆盖默认库位置。
@@ -227,6 +228,81 @@ function cmdUnquarantine(args) {
  * 存量补扫（P0-2 的回填）：把 `classifyContent` 跑一遍现有条目。
  * 没有这条命令，补扫只对"新落库"生效，历史语料仍然敞着（真实库 945 条里 201 条 origin=import）。
  */
+/**
+ * 通道可观测（P1-4）：抽最近若干条真实 query 跑一遍检索，统计各通道的"参与/跳过/异常"率。
+ *
+ * 为什么需要它：图通道有 `minEdges` 门槛，真实库边数不够时会**长期静默 skip**（不报错、不降级），
+ * 只有主动 `mem_diag` 单条查询才看得见。这个命令把"某个通道是不是一直在空转"变成一次可跑的数字。
+ */
+function cmdChannels(args) {
+  const { db, store } = openAndMigrate(args)
+  const { Recall } = recallModule
+  const { DEFAULT_CONFIG } = recallModule
+  const recall = new Recall(store, args.k ? { k: Number(args.k) } : {})
+  const limit = Math.max(1, Math.min(200, Number(args.limit) || 30))
+  let queries = []
+  try {
+    queries = db
+      .prepare('SELECT query, COUNT(*) AS n FROM recall_log WHERE query IS NOT NULL GROUP BY query ORDER BY n DESC LIMIT ?')
+      .all(limit)
+      .map((r) => r.query)
+  } catch {
+    queries = []
+  }
+  if (queries.length === 0) {
+    console.log('recall_log 里没有可采样的查询（先用 mem_search 跑几次再来看）')
+    closeDb(db)
+    return 0
+  }
+  const names = Object.keys(DEFAULT_CONFIG.channels)
+  const stat = Object.fromEntries(names.map((n) => [n, { runs: 0, skipped: 0, errored: 0, hits: 0, reasons: new Map() }]))
+  let ms = 0
+  for (const q of queries) {
+    const res = recall.search({ query: q, scopes: 'all', k: 8, log: false })
+    ms += res.ms ?? 0
+    for (const name of names) {
+      const c = res.channels?.[name]
+      if (!c) continue
+      stat[name].runs += 1
+      if (c.skipped) {
+        stat[name].skipped += 1
+        const reason = String(c.skipped)
+        stat[name].reasons.set(reason, (stat[name].reasons.get(reason) ?? 0) + 1)
+      }
+      if (c.error) stat[name].errored += 1
+      stat[name].hits += Number(c.count ?? 0)
+    }
+  }
+  const cfg = recall.config
+  console.log(`通道采样：${queries.length} 条真实查询，平均 ${(ms / queries.length).toFixed(1)} ms`)
+  /**
+   * 「跳过」要分原因看，否则读数会误导：时序通道在**查询里没有时间词**时跳过，这是设计内行为
+   * （不是"这个通道坏了"）；真正值得警惕的是 `超预算` / `冷启动` / 异常 / 门槛不足这类
+   * 「本该跑却没跑」。所以只对"非设计内"的跳过打警告。
+   */
+  /**
+   * 判定走 `isDesignIntendedSkip` 白名单（初版用黑名单，实测误报过两例：
+   * `disabled`（用户主动关掉）被报"考虑关掉省预算"、`时间窗口「X」内无语义相关条目` 被报成故障）。
+   * 异常另外单独告警 —— 异常时 `skipped` 为空，跳过率是 0，永远走不到上面那条 flag。
+   */
+  const { isDesignIntendedSkip } = recallModule
+  for (const name of names) {
+    const v = stat[name]
+    const skipRate = v.runs > 0 ? v.skipped / v.runs : 0
+    const realSkip = [...v.reasons.entries()].filter(([r]) => !isDesignIntendedSkip(r)).reduce((n, [, c]) => n + c, 0)
+    const flag = v.errored > 0 ? '  ← 有异常，先查原因' : skipRate >= 0.9 && realSkip > 0 ? '  ← 长期静默放弃，考虑调门槛或关掉省预算' : ''
+    const cfgLine = name === 'graph' ? `（minEdges=${cfg.channels.graph?.minEdges ?? '-'}）` : ''
+    const reasonText = v.reasons.size > 0 ? ` · 原因 ${[...v.reasons.entries()].map(([r, c]) => `${r}×${c}`).join(' / ')}` : ''
+    console.log(
+      `  ${name.padEnd(12)} 参与 ${v.runs}/${queries.length} · 跳过 ${v.skipped}（${(skipRate * 100).toFixed(0)}%）· 异常 ${v.errored} · 命中 ${v.hits}${cfgLine}${reasonText}${flag}`,
+    )
+  }
+  const edges = db.prepare("SELECT COUNT(*) AS n FROM edges WHERE kind = 'coRetrieval'").get()
+  console.log(`  coRetrieval 边：${edges?.n ?? 0}（图通道 minEdges=${cfg.channels.graph?.minEdges ?? '-'}）`)
+  closeDb(db)
+  return 0
+}
+
 function cmdRescan(args) {
   const { db, store } = openAndMigrate(args)
   const dryRun = args['dry-run'] === true || args.dryRun === true
@@ -793,6 +869,7 @@ const COMMANDS = {
   verify: cmdVerify,
   unquarantine: cmdUnquarantine,
   rescan: cmdRescan,
+  channels: cmdChannels,
   restore: cmdRestore,
   search: cmdSearch,
   diag: cmdDiag,
