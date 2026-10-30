@@ -238,6 +238,10 @@ CLI：`mem todo list|add|done|update|remove|remind|stats|export`、`mem skill li
     recall:
       persistSeen: true        # 注入水位持久化；false = 纯内存态
       statsDays: 7             # mem_status 召回质量的统计窗口（1–90 天）
+      threshold: 0             # 候选集内相对分下限（hit.score / 候选集最高分）；0 = 不约束
+      firstTurnBoost: false    # 会话首轮放宽 1 张卡片
+      evidence:                # 注意层级：evidence 是 recall 的子键（Recall 的配置形状）
+        requireTwoChannel: false  # true = 只承认「两通道同时命中且含词法/稀疏」
     importance:
       warnAbove: 0.8           # importance ≥ 该值 → mem_status 告警（只提示，不改值）
 ```
@@ -250,6 +254,24 @@ dsh-mem rescan               # 写入 meta.scan / quarantined
 dsh-mem unquarantine         # 列隔离清单
 dsh-mem unquarantine --all   # 确认是误杀 → 一键解除
 ```
+
+**三个「假开关」已接线（P1-1）**：`recall.threshold` / `recall.firstTurnBoost` / `recall.evidence.requireTwoChannel`
+过去只声明、从未被任何代码读过（`grep` 全仓只命中声明行）——按文档调参得到的是噪声，比没有开关更坏。
+
+| 键 | 真实语义（接线后） | 默认 | 边界 |
+|---|---|---|---|
+| `recall.threshold` | **候选集内**相对分下限（分母 = 候选集的最高分）。它**只能裁剪尾部**：候选集里分数最高的那条相对分恒为 1.000，所以任何 ≤1 的值都不可能把候选砍空。绝对强度门在证据判定（`evaluateEvidence`），两道闸职责分开 | `0`（不约束） | 只接受 `(0,1]` 的有限数，其余（`>1`/负数/`NaN`/布尔/`null`）一律回落 `0` 并视为不约束 |
+| `recall.firstTurnBoost` | 会话**首轮**（turns ≤ 1）`maxCards + 1` | `false` | 只改上限，不动 400 token 预算 |
+| `recall.evidence.requireTwoChannel` | 开启后**只承认「两通道同时命中、且至少一条来自词法/稀疏」**；单通道的通道前 N 名 / bm25 相对分 / 实体精确命中全部作废 | `false` | 只影响"要不要注入"，**不影响召回排序** |
+
+- **为什么「两通道」还要限定词法/稀疏**：真库实测 99.1% 的命中本来就 ≥2 通道（granularity/graph 太容易同时命中），
+  只按"≥2 通道"的话这个开关在真实语料上是**恒真**的（40 条真实查询 0 条翻转）——那是另一种"假开关"。
+- **默认值全中性且被跨版本对照钉住**：`test/p11-cross-version.test.js` 用 `git show 45d1091:lib/inject.js`
+  取回**接线前的实现**真跑，同一 fixture 上 8 次渲染与本实现**逐字节一致**；`maxCards` 的
+  `0 / 0.5 / null / 'abc'` 等非默认值也与旧版一致（显式 `0` 仍是"关掉"，不会被兜成 3 张）。
+  唯一有意偏差：负值旧版是 `slice(0,-1)`（少给最后一张），现在收敛为 `0`（关闭）。
+- **CLI 可直接验证**：`dsh-mem inject "查询" --threshold 0.9 --max-cards 2 [--first-turn-boost] [--budget 400]`。
+  以前预览写死 `config: {}`，读者按 README 改配置后在 CLI 上根本看不出差别。
 
 **已知未修（如实备案）**：
 

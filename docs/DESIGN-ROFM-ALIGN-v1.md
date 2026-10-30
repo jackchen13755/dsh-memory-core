@@ -491,3 +491,74 @@ P0 落地后交给「代码审查工程师」与「验收测试工程师」复�
 两位专家均为**只读**：仓库在 `/tmp` 复制后做变异/回退实验与库副本查询，审查前后 `git status` 一致。
 我方另做两项独立核对：① 863 个真实会话日志的 `source.kind` 全量普查；② 真实库副本上
 「HEAD 版 vs 工作区版」常驻段 A/B（结论：逐字节相同）。
+
+---
+
+## 10. P1-1：三个「假开关」接线（v0.0.20 第二轮，2026-10-30）
+
+### 10.1 问题
+
+三个键在代码里被声明、被写进配置示例，但**全仓没有任何读取点**（`grep` 只命中声明行）：
+
+| 键 | 原声明 | 原读取次数 | 症状 |
+|---|---|---|---|
+| `recall.threshold` | `inject.js` `0.62` | 0 | 按 0.62 调参毫无效果 |
+| `recall.firstTurnBoost` | `inject.js` `true` | 0 | 同上 |
+| `evidence.requireTwoChannel` | `recall.js` `false` | 0 | `evaluateEvidence` 只读 `topRank` / `bm25Ratio` |
+
+这与 `docs/BORROW-FROM-SOUL.md` 那次「274 项测试全绿、真机却不可用」是**同型问题**：
+配置承诺的开关不生效，按它调参得到的是噪声。
+
+### 10.2 接线后的语义（默认全中性）
+
+| 键 | 默认 | 语义 | 读取点 |
+|---|---|---|---|
+| `recall.threshold` | `0`（不约束） | **候选集内**相对分下限：`hit.score / eligible 的最高分 >= threshold`。分母只取候选集（排除已见/已隔离）——用全部 hits 做分母会让"已见的那张"把分母顶高，把本来合格的第一名判成不合格 | `renderRecallSection`（`resolveThreshold` / `passFloor`） |
+| `recall.firstTurnBoost` | `false` | 会话首轮（`turns <= 1`）`maxCards + 1`；`k` 同步放大以保证多出来那张有候选 | 同上（`resolveMaxCards`） |
+| `recall.evidence.requireTwoChannel` | `false` | 开启后只承认「两通道同时命中**且至少一条来自 lexical/sparse**」；单通道的通道前 N 名 / bm25 相对分 / 实体精确命中作废 | `Recall.evaluateEvidence` |
+
+**三处必须写清的边界（都是复核后改的，初版错了三处）**：
+
+1. **`threshold` 只能裁剪尾部，不可能砍空候选集。** 分母取候选集最高分 ⇒ 至少一条候选的相对分恒为 1.000 ≥ 任何 ≤1 的
+   floor。初版留过一个 `below-score-floor` 分支（"被 floor 砍空"），改对分母后它是**不可达的死代码**，已删除。
+   初版注释还把它说成"强度门"，容易误导下一个人拿它调召回质量 —— 真正的绝对门在 `evaluateEvidence`。
+2. **"两通道"必须含词法/稀疏。** 真实库实测（40 条真实 query / 320 条命中）**99.1% 的命中本来就 ≥2 通道**
+   （`granularity+lexical+sparse` 一项就 178 条），只按 `channelCount >= 2` 判断，开关打开后 **0/40 查询翻转** ——
+   接上了一个恒真的判据，等于另一种假开关。要求至少一条表面证据通道后，它才真的在收紧。
+   注意它收紧的是**单条命中的合格判据**；查询级 `evidence.inject` 只在"该查询没有任何一条合格命中"时才翻转，
+   真实查询通常仍有多条合格命中，所以查询级翻转数本来就不该大 —— 别拿"翻转少"当没生效。
+3. **`evidence` 的配置层级**：`Recall` 的配置形状是 `{ ...通道, evidence }`，而插件配置把检索参数放在 `recall` 下。
+   初版 README 把 `evidence:` 写成与 `recall:` 平级，而装配只传 `config.recall` ⇒ **该键仍读不到**（正是本轮要消灭的失败模式，
+   而单测直接 `new Recall(store, { evidence })` 恰好用了正确层级，所以测试全绿、真实装配仍死）。
+   现在 `index.js` 的 `recallConfigOf()` 把根部 `evidence` 并入 `recall.evidence`（两种写法都生效），README 以嵌套写法为准。
+
+### 10.3 验收（可机器判定）
+
+1. **跨版本逐字节对照**（`test/p11-cross-version.test.js`）：`git show 45d1091:lib/inject.js` 取回**接线前实现**真跑，
+   同一 fixture 上 4 条查询 × 2 个轮次 = **8 次渲染的文本与记账（cards/tokens/injected/reason）全等**；
+   `maxCards ∈ {0, 0.5, 1, 2, 3, 4, '4', null, 'abc'}` 的张数也与旧版逐项一致。基线取不到时**显式失败**（不许静默跳过）。
+   这一条是针对"默认等价"这个承诺本身：初版的"默认等价"两例比的都是**新代码对新代码**，把 `threshold` 默认值改回
+   0.62 照样全绿（回退变异 SURVIVED），而真库上它会改变 1/40 条查询的卡片。
+2. **默认值被钉住**：`RECALL_SECTION_DEFAULTS` 显式导出并逐键断言中性值。
+3. **中性值 = 省略该键**：断言逐字节一致（防 `...(config.recall ?? {})` 展开写错）。
+4. **接线真的生效**：`threshold` 测 0.5 / 0.95 / 1 三个点（不只测两端 plateau）并断言 `ids` 顺序；
+   `firstTurnBoost` 断言首轮 4 张、非首轮回落 ≤3；`requireTwoChannel` 断言"只有 granularity+graph"不算、
+   "含 lexical 的两通道"仍算（反向责任）、单通道不再算，**且召回排序不变**。
+5. **半截卡片**（顺带修的真缺陷）：`trimToBudget` 是行粒度贪心，可能留下 `[mem:…]` 标记行却丢掉正文 ——
+   那张"空壳卡"会被算进 `cards`、写进 `seen`，模型却什么都没看到。现在只有**标记行与正文行都留下**才算注入；
+   预算 20 token（连一行卡都装不下）时 cards=0 且 `seenIds=0`。
+6. **CLI 闭环**：`dsh-mem inject … --threshold --max-cards --first-turn-boost --budget` 可临时覆盖，
+   否则"改配置→看效果"对使用者是断的（预览原先写死 `config: {}`）。
+
+### 10.4 顺带修的诊断失真（初版写错，已改）
+
+`fresh.length === 0` 过去一律报 `reason='all-seen'`。现在按真实成因区分：
+
+| reason | 含义 | 记账 |
+|---|---|---|
+| `all-quarantined` | 命中的全被安全隔离（P0-2） | 记**未命中**（它不会自己变好，该停就停） |
+| `all-seen` | 证据达标但都注入过了 | 记**命中**（证据确实够，只是无新卡片） |
+| `cards-disabled` | `maxCards=0` 显式关掉卡片 | **不记账**（配置状态不是空转：记了会让 5 轮后本会话召回被永久静音） |
+
+**初版文档写错两处**（复核时被抓出）：① 声称"后两者（below-score-floor / all-seen）算未命中"，而代码里
+`all-seen` 一直是命中、`below-score-floor` 那一支在分母修正后不可达并被删除；② 没写 `cards-disabled`。

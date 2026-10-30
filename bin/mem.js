@@ -345,31 +345,45 @@ function cmdInject(args) {
   const cwd = args.cwd ? String(args.cwd) : process.cwd()
   const query = args._.join(' ')
 
-  const resident = renderResidentSection({ store, cwd, config: {} })
+  /**
+   * 允许临时覆盖按轮卡片的三个键（P1-1）：否则「改配置 → 看效果」这条闭环对使用者是断的 ——
+   * 预览固定传 `config: {}`，README 里说的 threshold / firstTurnBoost 在 CLI 上永远看不到差别。
+   * `--threshold 0` 之类显式传 0 也是有效值，所以用 `in args` 判断而不是真值判断。
+   */
+  const previewConfig = {}
+  const recallCfg = {}
+  if ('threshold' in args) recallCfg.threshold = Number(args.threshold)
+  if ('max-cards' in args) recallCfg.maxCards = Number(args['max-cards'])
+  if ('first-turn-boost' in args) recallCfg.firstTurnBoost = args['first-turn-boost'] !== 'false' && args['first-turn-boost'] !== false
+  if ('budget' in args) recallCfg.injectBudgetTokens = Number(args.budget)
+  if (Object.keys(recallCfg).length > 0) previewConfig.recall = recallCfg
+
+  const recallBudget = 'budget' in args ? Number(args.budget) : 400
+  const resident = renderResidentSection({ store, cwd, config: previewConfig })
   const ledger = new InjectionLedger()
   const sessionId = 'cli-preview'
   let cards = { text: '', tokens: 0, cards: 0, injected: false, reason: 'no-query' }
   if (query) {
     ledger.noteUserMessage(sessionId, query)
-    cards = renderRecallSection({ store, recall, ledger, sessionId, cwd, config: {} })
+    cards = renderRecallSection({ store, recall, ledger, sessionId, cwd, config: previewConfig })
   }
   // 第二轮：同一 query 再次渲染必须完全一致（不能重复消费卡片）
-  const again = query ? renderRecallSection({ store, recall, ledger, sessionId, cwd, config: {} }) : null
+  const again = query ? renderRecallSection({ store, recall, ledger, sessionId, cwd, config: previewConfig }) : null
 
   const report = {
     cwd,
     resident: { tokens: resident.tokens, rules: resident.rules, catalog: resident.catalog, rulesTokens: resident.rulesTokens, catalogTokens: resident.catalogTokens },
     recall: { tokens: cards.tokens, cards: cards.cards, injected: cards.injected, reason: cards.reason },
     stableWithinTurn: again ? again.text === cards.text : null,
-    budgets: { resident: 1200, recall: 400 },
-    withinBudget: resident.tokens <= 1200 && cards.tokens <= 400 && (again ? again.text === cards.text : true),
+    budgets: { resident: 1200, recall: recallBudget },
+    withinBudget: resident.tokens <= 1200 && cards.tokens <= recallBudget && (again ? again.text === cards.text : true),
   }
   if (args.json) {
     console.log(JSON.stringify({ ...report, residentText: resident.text, recallText: cards.text }, null, 2))
   } else {
     console.log(`注入预览（cwd=${cwd}）`)
     console.log(`  常驻段 ${resident.tokens} token（规则 ${resident.rules} 条 / 目录 ${resident.catalog} 条；预算 1200）`)
-    console.log(`  按轮卡片 ${cards.tokens} token / ${cards.cards} 张（预算 400，判定：${cards.injected ? '注入' : cards.reason}）`)
+    console.log(`  按轮卡片 ${cards.tokens} token / ${cards.cards} 张（预算 ${recallBudget}，判定：${cards.injected ? '注入' : cards.reason}）`)
     console.log(`  同轮稳定性：${report.stableWithinTurn === null ? '（未给 query）' : report.stableWithinTurn ? '✓ 同一 query 渲染一致' : '✗ 渲染抖动'}`)
     console.log(`  预算合规：${report.withinBudget ? '✓' : '✗'}（estimateTokens 保守偏高）`)
     console.log('\n──── 常驻段 ────')

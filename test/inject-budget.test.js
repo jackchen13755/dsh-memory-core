@@ -190,15 +190,30 @@ test('按轮卡片：预算收紧时只装装得下的卡片，仍不超预算�
   assert.ok(wide.text.includes('【本轮相关记忆（自动召回）】'), '标题行必须在（否则丢了卡片语义）')
   assert.ok(wide.cards >= 1)
 
-  // 把预算压到只装得下标题 + 第一张卡片
+  // 把预算压到只装得下标题 + 若干张完整卡片
   const ledger2 = new InjectionLedger()
   ledger2.noteUserMessage('b2', 'zulu 是什么')
-  const tight = renderRecallSection({ store, recall, ledger: ledger2, sessionId: 'b2', cwd: null, config: { recall: { injectBudgetTokens: 40 } } })
+  const tight = renderRecallSection({ store, recall, ledger: ledger2, sessionId: 'b2', cwd: null, config: { recall: { injectBudgetTokens: 110 } } })
   assert.equal(tight.injected, true)
-  assert.ok(tight.tokens <= 40, `收紧预算后仍超预算：${tight.tokens}`)
+  assert.ok(tight.tokens <= 110, `收紧预算后仍超预算：${tight.tokens}`)
   assert.ok(tight.text.length > 0, '预算再紧也不许给空段')
   assert.ok(tight.cards <= 3, `cards 不得超过 maxCards：${tight.cards}`)
   assert.ok(tight.text.includes('【本轮相关记忆（自动召回）】'), '保底时也要保住标题行')
+  // 每张被计入的卡片都必须**有正文**：不许出现只有 `[mem:…]` 标记行的空壳卡（P1-1 起更严）
+  const lines = tight.text.split('\n')
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!lines[i].startsWith('[mem:')) continue
+    const body = lines[i + 1] ?? ''
+    assert.ok(body && !body.startsWith('[mem:') && !body.startsWith('【'), `标记行后必须紧跟正文：${lines[i]}`)
+  }
+
+  // 预算紧到连"标记行 + 正文行"都装不下 → 一张都不注入（而不是塞一个没有内容的空壳）
+  const ledger3 = new InjectionLedger()
+  ledger3.noteUserMessage('b3', 'zulu 是什么')
+  const tooTight = renderRecallSection({ store, recall, ledger: ledger3, sessionId: 'b3', cwd: null, config: { recall: { injectBudgetTokens: 20 } } })
+  assert.equal(tooTight.cards, 0, `装不下完整卡片时不该凑数：${tooTight.cards}`)
+  assert.equal(tooTight.injected, false)
+  assert.equal(ledger3.snapshot('b3').session.seenIds, 0, '没真正注入的卡片绝不能进 seen')
   closeDb(db)
 })
 
