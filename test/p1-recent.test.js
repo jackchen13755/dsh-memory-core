@@ -68,6 +68,29 @@ test('P1 超长单条被截断（一条长输出不许吃光预算）', () => {
   assert.ok(res.tokens <= RECENT_DEFAULTS.budgetTokens, `超预算：${res.tokens}`)
 })
 
+test('P1 按用户轮取（agentic 会话里助手消息远多于用户）：不得抓满助手自言自语', () => {
+  // 模拟真实形态：1 轮用户 + 中间 6 条助手工具步骤 + 最后 1 条助手结论
+  const events = [
+    U('把 FooterButton 宽度改成 120px', 1),
+    A('先读文件…', 2),
+    A('搜到 3 处引用…', 3),
+    A('改好了，跑了测试…', 4),
+    A('已改完，测试通过', 5),
+    U('再看下间距', 6),
+    A('正在看…', 7),
+    A('间距也调好了', 8),
+  ]
+  const session = { id: 's-agentic', ownEvents: () => events }
+  const { res } = run({ turns: 1, config: { recent: { turns: 2, excludeTailMessages: 0 } }, session })
+  const lines = res.text.split('\n').filter((l) => l.startsWith('- '))
+  const users = lines.filter((l) => l.startsWith('- 用户: '))
+  const assistants = lines.filter((l) => l.startsWith('- 助手: '))
+  assert.equal(users.length, 2, `应有 2 条用户原话，实际 ${users.length}`)
+  assert.equal(assistants.length, 2, `每轮只带 1 条助手回复，实际 ${assistants.length}`)
+  assert.ok(res.text.includes('已改完，测试通过'), '应带该轮的结论，而不是中间的"先读文件…"')
+  assert.ok(!res.text.includes('先读文件'), '中间的工具过程不该进原文块')
+})
+
 test('P1 只在边界发：非边界返回 not-boundary（否则每步追加快照，成本 K×块大小）', () => {
   const mid = run({ turns: 8, compactedAt: null })
   assert.equal(mid.res.reason, 'not-boundary')
