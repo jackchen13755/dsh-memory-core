@@ -219,6 +219,7 @@ function cmdUnquarantine(args) {
     store.logChange('unit', id, 'upsert', { meta, reason: 'unquarantine' })
     cleared += 1
   }
+  if (cleared > 0) store.bumpMetaEpoch() // 只改 meta：不推纪元的话运行中的进程看不到
   console.log(`已解除隔离 ${cleared} 条（下一轮注入即恢复）`)
   closeDb(db)
   return 0

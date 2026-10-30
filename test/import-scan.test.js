@@ -303,3 +303,26 @@ test('人已解除隔离后，对端一次 upsert 不得把它标回来（人类
   assert.equal(meta.scan.clearedFor, 'hash-human-1')
   closeDb(db)
 })
+
+test('可见性：rescan 只改 meta，运行中的进程也必须立刻看到隔离（meta 纪元）', async () => {
+  const { rescanUnits } = await import('../lib/rescan.js')
+  const { Recall } = await import('../lib/recall.js')
+  const { db, store } = fixture()
+  const id = store.insertUnit({ track: 'memory', scope: 'global', kind: 'rule', content: HIGH }).id
+  const recall = new Recall(store)
+  recall.search({ query: 'zulu', scopes: 'all', k: 5, log: false })
+  assert.equal(recall.corpus.docs.get(id)?.quarantined, false, '前提：未隔离')
+
+  const stats = rescanUnits(store)
+  assert.ok(stats.changed >= 1, '应有改写')
+  recall.search({ query: 'zulu', scopes: 'all', k: 5, log: false })
+  // 只改 meta、不动 updated_at ⇒ 必须靠 meta 纪元让语料失效，否则同一进程仍用旧语料（实测过这个坑）
+  assert.equal(recall.corpus.docs.get(id)?.quarantined, true, '同一进程必须立刻看到隔离，否则回填等于没生效')
+
+  const hash = db.prepare('SELECT content_hash FROM units WHERE id = ?').get(id).content_hash
+  db.prepare('UPDATE units SET meta = ? WHERE id = ?').run(JSON.stringify({ scan: { level: 'high', clearedFor: hash, clearedAt: 1 } }), id)
+  store.bumpMetaEpoch()
+  recall.search({ query: 'zulu', scopes: 'all', k: 5, log: false })
+  assert.equal(recall.corpus.docs.get(id)?.quarantined, false, '人解除后也必须立刻可见')
+  closeDb(db)
+})
