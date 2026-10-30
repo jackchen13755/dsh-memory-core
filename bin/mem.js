@@ -9,6 +9,8 @@
  *   dsh-mem backup  [--keep 7]
  *   dsh-mem verify  [--dir <旧记忆目录>] [--roundtrip]
  *   dsh-mem restore --from <快照目录> [--db <新库路径>]
+ *   dsh-mem unquarantine [--id <id[,id]>] [--all]   # 解除隔离（只隔离不删除的可逆出口）
+ *   dsh-mem rescan [--dry-run] [--limit N]          # 存量补扫：对现有条目跑一遍分级
  *   dsh-mem sql "<query>"
  *
  * 通用参数：`--db <路径>` 覆盖默认库位置。
@@ -19,6 +21,7 @@ import { dirname, join, resolve } from 'node:path'
 import { backupDaily, closeDb, latestBackup, migrate, openDb, quickCheck } from '../lib/db.js'
 import { importLegacy } from '../lib/legacy-import.js'
 import { backupDir, dataDir, dbPath as defaultDbPath, ensureDir, legacyMemoryDir, projectHash } from '../lib/paths.js'
+import { rescanUnits } from '../lib/rescan.js'
 import { diffSnapshot, exportSnapshot } from '../lib/snapshot.js'
 import { Store } from '../lib/store.js'
 import * as tokensModule from '../lib/tokens.js'
@@ -166,6 +169,76 @@ function cmdVerify(args) {
   closeDb(db)
   console.log(failures === 0 ? '对账通过 ✅' : `对账失败 ${failures} 项 ❌`)
   return failures === 0 ? 0 : 1
+}
+
+/**
+ * 隔离条目的可逆出口（P0-2）：导入/同步补扫判 high 的条目写 `meta.quarantined=true`，
+ * 不进自动注入但**从不删除**。人判断是误杀时，用这条命令一键解除。
+ * `--all` 解全部；不给 id 且不给 --all 时只列出当前隔离清单。
+ */
+function cmdUnquarantine(args) {
+  const { db, store } = openAndMigrate(args)
+  const ids = String(args.id ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  const rows = db.prepare(`SELECT id, track, kind, substr(content, 1, 60) AS head FROM units WHERE status = 'active' AND meta LIKE '%"quarantined":true%' ORDER BY updated_at DESC`).all()
+  if (rows.length === 0) {
+    console.log('没有隔离条目 ✅')
+    closeDb(db)
+    return 0
+  }
+  if (ids.length === 0 && args.all !== true) {
+    console.log(`隔离中 ${rows.length} 条（用 --id <id[,id]> 或 --all 解除）：`)
+    for (const r of rows) console.log(`  ${r.id}  ${r.track}/${r.kind ?? '-'}  ${String(r.head).replace(/\s+/g, ' ')}`)
+    closeDb(db)
+    return 0
+  }
+  const targets = args.all === true ? rows.map((r) => r.id) : rows.filter((r) => ids.includes(r.id)).map((r) => r.id)
+  if (targets.length === 0) {
+    console.log(`给的 id 都不在隔离清单里：${ids.join(', ')}`)
+    closeDb(db)
+    return 2
+  }
+  let cleared = 0
+  for (const id of targets) {
+    const row = db.prepare('SELECT meta FROM units WHERE id = ?').get(id)
+    let meta = {}
+    try {
+      meta = row?.meta ? JSON.parse(row.meta) : {}
+    } catch {
+      meta = {}
+    }
+    delete meta.quarantined
+    delete meta.untrusted
+    // 记下"解除针对的是哪一版内容"：内容没变时，跨设备同步/存量补扫都不得把它标回隔离
+    const rowHash = db.prepare('SELECT content_hash FROM units WHERE id = ?').get(id)?.content_hash ?? null
+    meta.scan = { ...(meta.scan ?? {}), clearedAt: Date.now(), clearedBy: 'cli', clearedFor: rowHash }
+    db.prepare('UPDATE units SET meta = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(meta), Date.now(), id)
+    store.logChange('unit', id, 'upsert', { meta, reason: 'unquarantine' })
+    cleared += 1
+  }
+  console.log(`已解除隔离 ${cleared} 条（下一轮注入即恢复）`)
+  closeDb(db)
+  return 0
+}
+
+/**
+ * 存量补扫（P0-2 的回填）：把 `classifyContent` 跑一遍现有条目。
+ * 没有这条命令，补扫只对"新落库"生效，历史语料仍然敞着（真实库 945 条里 201 条 origin=import）。
+ */
+function cmdRescan(args) {
+  const { db, store } = openAndMigrate(args)
+  const dryRun = args['dry-run'] === true || args.dryRun === true
+  const stats = rescanUnits(store, { dryRun, limit: args.limit ? Number(args.limit) : 0 })
+  console.log(`扫描 ${stats.scanned}/${stats.total} 条：clean ${stats.clean} · medium ${stats.medium} · high ${stats.high}`)
+  if (stats.keptCleared > 0) console.log(`人已解除且内容未变：${stats.keptCleared} 条（保持解除）`)
+  console.log(`将会/已隔离：${stats.quarantined} 条 · 需要改写 meta：${stats.changed} 条${dryRun ? '（dry-run，未写入）' : ''}`)
+  if (stats.quarantined > 0 && stats.changed > 0) {
+    console.log('被隔离的条目不再自动注入，但仍可用 mem_search / mem_get 取回；确认是误杀就 dsh-mem unquarantine --id <id>')
+  }
+  closeDb(db)
+  return 0
 }
 
 function cmdRestore(args) {
@@ -704,6 +777,8 @@ const COMMANDS = {
   export: cmdExport,
   backup: cmdBackup,
   verify: cmdVerify,
+  unquarantine: cmdUnquarantine,
+  rescan: cmdRescan,
   restore: cmdRestore,
   search: cmdSearch,
   diag: cmdDiag,
