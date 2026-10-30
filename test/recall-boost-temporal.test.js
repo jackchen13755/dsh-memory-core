@@ -194,12 +194,30 @@ test('保底席位：前 baselineSeats 条 = 纯 C1+C2 RRF 的前 N 名（加权
   assert.ok(c2.boost > 1 && c1.boost < 1, `加权应压低低价值条目、抬高高价值条目：c1=${c1.boost} c2=${c2.boost}`)
   assert.equal(res.baselineIds[1], 'c1', 'c1 是纯 RRF 第 2 名，必须原样拿到保底席位')
   assert.ok(res.hits.indexOf(c1) > 0, 'c1 只拿到保底席位，不能靠加权排到最前')
-  // ② 名次不保底：hits 的顺序必须按"总榜（含加权）"排，而不是"先保底后补位"的拼接序。
-  //    这里 c2 在总榜第 1、c1 被加权压后 → 若有人把保底改成"名次也保"，本断言会立刻红。
+  // ② 名次不保底（2026-10-30 起语义收紧）：hits 的顺序必须符合**文档化比较器**，而不是
+  //    "先保底后补位"的拼接序，也不是"纯按加权分降序"：
+  //      逐字命中 > |rrf 相对差| > tieEpsilon 时按 rrf > 近似平手时按加权分
+  //    之所以不再断言"按 score 降序"，是因为那条顺序允许加权越过词面显著更强的条目 ——
+  //    实测唯一标识符会被 importance/usage 挤到第 2，而设计一直写着"不允许盖过词面证据"。
+  const eps = DEFAULT_CONFIG.boosts.tieEpsilon
   for (let i = 1; i < res.hits.length; i += 1) {
-    assert.ok(res.hits[i - 1].score >= res.hits[i].score, `hits 必须按总榜分数降序（名次不受保底保护）：${res.hits.map((h) => h.id)}`)
+    const a = res.hits[i - 1]
+    const b = res.hits[i]
+    if (a.verbatim !== b.verbatim) {
+      assert.ok(a.verbatim, `逐字命中必须置顶：${res.hits.map((h) => h.id)}`)
+      continue
+    }
+    const hi = Math.max(a.rrf, b.rrf) || 1
+    if (Math.abs(b.rrf - a.rrf) / hi > eps) {
+      assert.ok(a.rrf >= b.rrf, `rrf 差距 > ${eps} 时必须按 rrf 排：${a.id}(${a.rrf.toFixed(4)}) 不应排在 ${b.id}(${b.rrf.toFixed(4)}) 前面`)
+    } else {
+      assert.ok(a.score >= b.score, `近似平手时才让加权决定：${a.id} vs ${b.id}`)
+    }
   }
-  assert.equal(res.hits[0].id, c2.id, '总榜第 1 应是加权后的 c2，而不是保底第 1 的 c1')
+  // c1（纯 RRF 更强）在 rrf 差距显著时不得被 c2 的加权越过 —— 这是新契约的核心
+  if (Math.abs(c1.rrf - c2.rrf) / (Math.max(c1.rrf, c2.rrf) || 1) > eps) {
+    assert.ok(res.hits.indexOf(c1) < res.hits.indexOf(c2), 'rrf 差距显著时，加权不得把 c2 抬到 c1 前面')
+  }
   // 加权只影响 overall：c2 的 score 与 rrf 的关系印证"乘性叠加在 RRF 上"
   assert.ok(Math.abs(c2.score - c2.rrf * c2.boost) < 1e-12)
   closeDb(db)
@@ -318,11 +336,13 @@ test('recency 信号：occurred_at 优先于 created_at（事件时间，不是�
 })
 
 test('proof 信号：derivedFrom 入边数只作用于 abstract 条目', () => {
+  // 注意：两条都**不能**逐字包含查询串，否则会被 verbatim 置顶规则先抢走（那是另一条规则，
+  // 有专门的测试），这里要测的是 proof 加权在 rrf 近似平手时的次序作用。
   const units = [
-    // 词面更弱、但有 3 条派生证据
-    { id: 'absProved', content: '抽象：本机 Figma 还原链路的固定顺序', kind: 'abstract', importance: 0.5 },
-    // 词面更强、无派生证据
-    { id: 'absBare', content: '抽象 Figma 还原链路 固定顺序 抽象 Figma 还原链路 固定顺序', kind: 'abstract', importance: 0.5 },
+    // 词面略弱、但有 3 条派生证据
+    { id: 'absProved', content: '抽象 链路固定顺序 本机 Figma 还原', kind: 'abstract', importance: 0.5 },
+    // 词面略强、无派生证据
+    { id: 'absBare', content: '抽象 链路固定顺序 本机 Figma 还原 固定顺序', kind: 'abstract', importance: 0.5 },
     { id: 'factSame', content: '普通条目：与查询无关', kind: 'fact', importance: 0.5 },
   ]
   const { db, store, recall } = fixture({
@@ -338,17 +358,44 @@ test('proof 信号：derivedFrom 入边数只作用于 abstract 条目', () => {
   assert.equal(recall.boostFor('absBare').signals.proof, 0, '无派生证据的抽象层条目 → 0')
   assert.equal(recall.boostFor('factSame').signals.proof, 0.5, '普通条目恒中性')
 
-  const query = '抽象 Figma 还原链路 固定顺序'
+  const query = '抽象 Figma 还原 链路固定顺序'
   const res = recall.search({ query, k: 2, log: false })
-  assert.equal(res.hits[0].id, 'absProved', '有派生证据的抽象条目应越过词面更强的无证据条目')
-  assert.equal(res.hits[1].id, 'absBare')
+  const byId = new Map(res.hits.map((h) => [h.id, h]))
+  const proved = byId.get('absProved')
+  const bare = byId.get('absBare')
+  assert.ok(proved && bare, '两条都应在结果里')
+  // 信号本身照算（proof 只作用于 abstract；这点与排序策略无关）
+  assert.ok(proved.boost > bare.boost, `有派生证据的条目加权分应更高：${proved.boost} vs ${bare.boost}`)
+  /**
+   * 2026-10-30 起 proof **只能在 rrf 近似平手时决定先后**（之前它可以把词面显著更强的条目直接越过，
+   * 那正是"加权盖过词面证据"的同一个毛病）。所以这里分开断言两种情况，而不是一刀切"必须越过"：
+   */
+  const eps = DEFAULT_CONFIG.boosts.tieEpsilon
+  const gap = Math.abs(proved.rrf - bare.rrf) / (Math.max(proved.rrf, bare.rrf) || 1)
+  if (gap > eps) {
+    assert.equal(res.hits[0].id, 'absBare', `rrf 差距 ${(gap * 100).toFixed(1)}% > ε 时，词面更强的 absBare 必须在前`)
+  } else {
+    assert.equal(res.hits[0].id, 'absProved', `rrf 近似平手（${(gap * 100).toFixed(1)}%）时，proof 加权应把 absProved 抬到前面`)
+  }
 
-  // 关掉 proof 权重 → 回到词面排序（证明上面的翻转确实由 proof 信号带来）
+  /**
+   * 关掉 proof 权重做**方向性**对照（不硬编码谁第一）：
+   * BM25 有长度归一化，"哪条词面更强"取决于词频/长度，靠改夹具去凑"必须是 absBare 第一"很容易写出
+   * 一个只在当前 tokenizer 下成立的假前提（本测试的第一版就栽在这里：换了夹具后 absProved 反而词面更强）。
+   * 这里断言的是 proof 信号**只能帮忙、不能添乱**：
+   *   - 有 proof 时该条目的名次 ≤ 无 proof 时的名次；
+   *   - 且 proof 关掉后它的 boost 与对手相同（因子恒 1），说明差异确实来自 proof。
+   */
   const plain = fixture({
     units,
     config: { boosts: { enabled: true, recencyAlpha: 0, importanceAlpha: 0, usageAlpha: 0, proofAlpha: 0 }, coldStartUnits: 0 },
   })
-  assert.equal(plain.recall.search({ query, k: 2, log: false }).hits[0].id, 'absBare')
+  const plainRes = plain.recall.search({ query, k: 2, log: false })
+  const rankOf = (res, id) => res.hits.findIndex((h) => h.id === id)
+  assert.ok(rankOf(res, 'absProved') <= rankOf(plainRes, 'absProved'), 'proof 只能抬高或保持名次，不得压低')
+  const plainProved = plainRes.hits.find((h) => h.id === 'absProved')
+  const plainBare = plainRes.hits.find((h) => h.id === 'absBare')
+  assert.equal(plainProved.boost, plainBare.boost, 'proofAlpha=0 时两条的加权因子应相同（差异只能来自 rrf）')
   closeDb(db)
   closeDb(plain.db)
 })
