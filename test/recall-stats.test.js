@@ -107,3 +107,34 @@ test('mem_status：窗口外（超过 statsDays）的检索不计入', async () 
   assert.equal(out.recallStats.retrievals, 0, '10 天前的检索不应计入近 1 天窗口')
   closeDb(db)
 })
+
+test('mem_status 会先刷新能力探测（修「tools=✗ 但工具在跑」的误报）', async () => {
+  const { db, store } = fixture()
+  const recall = new Recall(store)
+  // 模拟"启动时探测落空、真正跑起来后服务已就绪"的场景
+  const host = {
+    version: '0.2.1-rc.5',
+    supported: '>=0.1.5-rc.1',
+    compatible: true,
+    caps: { tools: false, systemPrompt: true, commands: false, llm: true, webserver: false, sessionEvents: true },
+    refresh() {
+      this.caps = { ...this.caps, tools: true, commands: true, webserver: true }
+      return this
+    },
+  }
+  const tool = buildTools({ store, recall, host, config: {} }).find((t) => t.name === 'mem_status')
+  const out = await tool.execute({})
+  assert.equal(out.host.caps.tools, true, '刷新后应报告 tools 可用')
+  assert.ok(out.text.includes('tools=✓'), `文本必须反映刷新后的能力：\n${out.text}`)
+  assert.ok(out.text.includes('commands=✓'))
+  closeDb(db)
+})
+
+test('mem_status 没有 refresh 时（老宿主/测试桩）不得报错', async () => {
+  const { db, store } = fixture()
+  const recall = new Recall(store)
+  const tool = buildTools({ store, recall, host: { version: '0.1.5', caps: { tools: true } }, config: {} }).find((t) => t.name === 'mem_status')
+  const out = await tool.execute({})
+  assert.ok(out.text.length > 0)
+  closeDb(db)
+})
