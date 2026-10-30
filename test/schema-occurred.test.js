@@ -247,14 +247,25 @@ ${TRACK_GUIDE}
 2. 不确定的内容 confidence 给低分（助手推断 ≤0.6，用户明说可 0.9+）；
 3. 保留原文语言与标识符原样，不要翻译、不要改写路径与组件名。`
 
-test('EXTRACT_SYSTEM 的改造面仅限 occurredAt：抹掉新增两处即与改造前逐字一致（golden 对比）', () => {
-  const stripped = EXTRACT_SYSTEM
+test('EXTRACT_SYSTEM 的改造面已登记：occurredAt + 排除清单，抹掉这两批新增即与改造前逐字一致（golden 对比）', () => {
+  // P0-2 新增的「不要把插件注入的段当用户发言」清单：**显式登记**在这里，
+  // 而不是把断言放宽成"包含关系" —— 这个 golden 的作用就是拦住无意的提示词漂移。
+  const EXCLUDE = [
+    '\n**也不要把这些当成"用户说过的话"**（它们是插件或压缩器注入的运行时内容，不是对话）：',
+    '会话骨架段（形如「[会话骨架]」「约束:/决策:/进度:」）、记忆注入块（形如「【记忆（dsh-memory-core）】」「【本轮相关记忆（自动召回）】」）、',
+    '压缩检查点摘要（形如「[memory] N 段更早的对话已归档」）、系统提醒块（形如「<system-reminder>」）以及任何以「Current runtime context」开头的快照正文。',
+    '这些块里出现的规则/决定，只能作为"线索"去**原文对话**里找依据；找不到依据就不要写进 items。',
+  ]
+  let stripped = EXTRACT_SYSTEM
     .replace(',"occurredAt":"YYYY-MM-DD 或 null"', '')
     .replace('\n4. occurredAt = 这条事实/事件**发生**的时间（不是现在、不是对话时间）：能从上下文判定就写 YYYY-MM-DD，判不出或只是泛泛而谈就写 null，**不要编造日期**。', '')
     .replace('不要翻译、不要改写路径与组件名；', '不要翻译、不要改写路径与组件名。')
-  assert.equal(stripped, PRE_CHANGE_SYSTEM, '除 occurredAt 外，提示词必须与改造前逐字一致')
+  for (const line of EXCLUDE) stripped = stripped.replace(line, '').replace(line, '')
+  stripped = stripped.replace(/\n{2,}/g, '\n')
+  assert.equal(stripped.replace(/\n+/g, '\n'), PRE_CHANGE_SYSTEM.replace(/\n+/g, '\n'), '除已登记的改动外，提示词必须与改造前逐字一致')
   assert.ok(EXTRACT_SYSTEM.includes('"occurredAt":"YYYY-MM-DD 或 null"'), '输出格式必须声明 occurredAt')
   assert.ok(EXTRACT_SYSTEM.includes('4. occurredAt ='), '必须给出 occurredAt 的填写判据（判不出写 null，不要编造）')
+  for (const line of EXCLUDE) assert.ok(EXTRACT_SYSTEM.includes(line.trim()), `P0-2 排除清单必须在场：${line.slice(0, 20)}…`)
 })
 
 test('extractSession 端到端：mission 进提示词、occurredAt 落到 item（坏字段不丢条目）', async () => {
